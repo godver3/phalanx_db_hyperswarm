@@ -219,26 +219,11 @@ app.get('/api/debug', async (req, res) => {
 });
 
 // Set up the server
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8888;
 app.listen(PORT, () => {
   console.log(`REST API server running on http://localhost:${PORT}`);
   console.log(`Debug info available at http://localhost:${PORT}/api/debug`);
   console.log(`List entries at http://localhost:${PORT}/api/entries`);
-  console.log(`\nThis API supports the structured format with infohash and services:`);
-  console.log(`{
-  "data": [
-    {
-      "infohash": "example_hash_123",
-      "services": {
-        "service_name": {
-          "cached": true,
-          "last_modified": "2023-04-15T12:00:00Z",
-          "expiry": "2023-05-15T12:00:00Z"
-        }
-      }
-    }
-  ]
-}`);
 });
 
 // Handle shutdown

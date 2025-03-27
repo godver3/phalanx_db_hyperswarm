@@ -16,7 +16,7 @@ COPY phalanx_db_rest.js ./
 RUN mkdir -p /app/p2p-db-storage /app/db_data
 
 # Expose the default port
-EXPOSE 3000
+EXPOSE 8888
 
 # Set up volumes for persistent storage
 VOLUME ["/app/p2p-db-storage", "/app/db_data"]
