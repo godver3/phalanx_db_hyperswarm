@@ -9,11 +9,6 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 
-# Environment variables
-.env
-.env.local
-.env.*.local
-
 # Runtime data
 p2p-db-storage/
 db_data/
