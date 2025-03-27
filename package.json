@@ -1,0 +1,31 @@
+{
+  "name": "phalanx-db",
+  "version": "1.0.0",
+  "description": "P2P distributed database built with Hyperswarm",
+  "main": "phalanx_db_rest.js",
+  "scripts": {
+    "start": "node phalanx_db_rest.js",
+    "dev": "DEBUG=true node phalanx_db_rest.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "hyperswarm": "^3.0.0",
+    "level": "^8.0.0",
+    "dotenv": "^16.0.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourusername/phalanx-db.git"
+  },
+  "keywords": [
+    "p2p",
+    "database",
+    "hyperswarm",
+    "distributed"
+  ],
+  "author": "",
+  "license": "MIT"
+}

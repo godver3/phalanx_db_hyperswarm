@@ -1,0 +1,15 @@
+services:
+  phalanx_db:
+    build: .
+    ports:
+      - "3001:3000"
+    volumes:
+      - phalanx-db-storage:/app/p2p-db-storage
+      - phalanx-db-data:/app/db_data
+    environment:
+      - NODE_ENV=production
+      - DEBUG=true
+
+volumes:
+  phalanx-db-storage:
+  phalanx-db-data:
