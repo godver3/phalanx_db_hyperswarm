@@ -749,14 +749,12 @@ class P2PDBClient {
             peerInfo: info
           });
           
-          // Initial sync
-          this.handleSyncRequest(socket, 'initial_connection').catch(err => {
-            this.log('INITIAL_SYNC_ERROR', {
-              error: err.message,
-              stack: err.stack
-            });
-            this.stats.errors++;
-          });
+          // Request initial state from peer
+          socket.write(JSON.stringify({
+            requestSync: true,
+            senderNodeId: this.nodeId,
+            trigger: 'initial_connection'
+          }));
           
           // Setup socket data handling
           socket.on('data', data => {
