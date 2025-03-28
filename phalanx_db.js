@@ -7,6 +7,33 @@ const path = require('path');
 const fs = require('fs');
 const { Level } = require('level');
 
+// Add logging setup
+class Logger {
+  constructor(options = {}) {
+    this.debug = options.debug || false;
+    this.logFile = options.logFile || path.join(__dirname, 'sync_debug.jsonl');
+    this.console = options.console || false;
+  }
+
+  log(type, data) {
+    const entry = {
+      timestamp: new Date().toISOString(),
+      type,
+      ...data
+    };
+
+    // Write to file in JSONL format
+    if (this.debug) {
+      fs.appendFileSync(this.logFile, JSON.stringify(entry) + '\n');
+    }
+
+    // Optional console output
+    if (this.console) {
+      console.log(`[${entry.timestamp}] [${type}]`, data);
+    }
+  }
+}
+
 // Basic setup
 const storageDir = path.join(__dirname, 'p2p-db-storage');
 fs.mkdirSync(storageDir, { recursive: true });
@@ -311,6 +338,13 @@ class P2PDBClient {
     this.topicString = options.topic || 'p2p-database-example';
     this.debug = options.debug || false;
     
+    // Initialize logger
+    this.logger = new Logger({
+      debug: this.debug,
+      logFile: path.join(this.storageDir, `sync_debug_${this.nodeId}.jsonl`),
+      console: this.debug
+    });
+    
     nodeId = this.nodeId;
     
     console.log('Node ID:', this.nodeId);
@@ -336,6 +370,28 @@ class P2PDBClient {
       lastSyncAt: null,
       lastChangeAt: null
     };
+
+    // Track sync chains
+    this.activeSyncs = new Map(); // Track active syncs by peer
+
+    // Add sync control
+    this.lastSyncTime = new Map(); // Track last sync time per peer
+    this.MIN_SYNC_INTERVAL = 1000; // Minimum ms between syncs with same peer
+    this.syncInProgress = new Set(); // Track ongoing syncs
+    this.MAX_SYNC_CHAIN = 3; // Maximum length of sync chain
+
+    // Add memory management
+    this.BUFFER_LIMIT = 100000; // 100KB limit per socket buffer
+    this.CLEANUP_INTERVAL = 60000; // Run cleanup every minute
+    this.lastCleanup = Date.now();
+    
+    // Track socket buffers
+    this.socketBuffers = new WeakMap();
+    
+    // Cache database state
+    this.cachedState = null;
+    this.cacheTimeout = null;
+    this.CACHE_DURATION = 1000; // Cache state for 1 second
   }
   
   async initializeDatabase() {
@@ -350,10 +406,11 @@ class P2PDBClient {
   }
   
   // Log debug messages if debug mode is on
-  log(...args) {
-    if (this.debug) {
-      console.log(`[${new Date().toISOString()}]`, ...args);
-    }
+  log(type, data) {
+    this.logger.log(type, {
+      nodeId: this.nodeId,
+      ...data
+    });
   }
   
   // Get stats about the P2P connection
@@ -418,90 +475,256 @@ class P2PDBClient {
   }
   
   // Function to handle sync with a new peer
-  async handleSyncRequest(socket) {
+  async handleSyncRequest(socket, trigger = 'unknown') {
     try {
+      const peerId = socket._peerNodeId || 'unknown';
+      
+      // Prevent sync loops and throttle syncs
+      if (this.syncInProgress.has(peerId)) {
+        this.log('SYNC_SKIP', {
+          peerId,
+          reason: 'sync_in_progress'
+        });
+        return;
+      }
+
+      // Check sync chain length
+      const syncChain = socket._syncChain || [];
+      if (syncChain.includes(this.nodeId) || syncChain.length >= this.MAX_SYNC_CHAIN) {
+        this.log('SYNC_SKIP', {
+          peerId,
+          reason: 'chain_limit',
+          chainLength: syncChain.length
+        });
+        return;
+      }
+
+      // Enforce minimum time between syncs
+      const now = Date.now();
+      const lastSync = this.lastSyncTime.get(peerId) || 0;
+      if (now - lastSync < this.MIN_SYNC_INTERVAL) {
+        this.log('SYNC_SKIP', {
+          peerId,
+          reason: 'rate_limit',
+          timeSinceLastSync: now - lastSync
+        });
+        return;
+      }
+
+      // Track sync start
+      this.syncInProgress.add(peerId);
+      this.lastSyncTime.set(peerId, now);
+      socket._syncChain = [...syncChain, this.nodeId];
+      
+      this.log('SYNC_START', {
+        peerId,
+        trigger,
+        syncChain: socket._syncChain,
+        activeConnections: this.connections.size
+      });
+      
       // Get current database state
       const dbState = await this.db.toJSON();
       
-      // Add our nodeId to the message
+      // Add our nodeId and version info to the message
       const message = JSON.stringify({
         ...dbState,
-        senderNodeId: this.nodeId
+        senderNodeId: this.nodeId,
+        syncChain: socket._syncChain
       });
+      
       socket.write(message);
-      this.log('Sent database state to peer,', message.length, 'bytes');
       this.stats.syncsSent++;
       this.stats.lastSyncAt = new Date().toISOString();
       
-      // Also request their state back
-      setTimeout(() => {
-        if (!socket.destroyed) {
-          socket.write(JSON.stringify({ 
-            requestSync: true,
-            senderNodeId: this.nodeId 
-          }));
-          this.log('Requested peer database state');
-        }
-      }, 500);
-    } catch (err) {
-      console.error('Error handling sync:', err);
-      this.stats.errors++;
+      this.log('SYNC_SENT', {
+        peerId,
+        trigger,
+        dataSize: message.length,
+        syncChain: socket._syncChain
+      });
       
-      setTimeout(() => {
-        if (socket && !socket.destroyed) {
-          this.log('Retrying sync after error');
-          this.handleSyncRequest(socket).catch(err => {
-            console.error('Error in sync retry:', err);
-          });
-        }
-      }, 2000);
+      // Only request state back if this wasn't a response to their sync
+      if (!trigger.startsWith('peer_request_')) {
+        setTimeout(() => {
+          if (!socket.destroyed) {
+            socket.write(JSON.stringify({ 
+              requestSync: true,
+              senderNodeId: this.nodeId,
+              trigger: 'response_request',
+              syncChain: socket._syncChain
+            }));
+            
+            this.log('SYNC_REQUEST', {
+              peerId,
+              trigger: 'response_request',
+              syncChain: socket._syncChain
+            });
+          }
+        }, 500);
+      }
+    } catch (err) {
+      this.log('SYNC_ERROR', {
+        error: err.message,
+        stack: err.stack,
+        trigger
+      });
+      this.stats.errors++;
+    } finally {
+      // Clear sync state
+      if (socket._peerNodeId) {
+        this.syncInProgress.delete(socket._peerNodeId);
+      }
     }
   }
   
-  // Handle incoming data from peers
+  // Get database state with caching
+  async getDatabaseState() {
+    const now = Date.now();
+    if (this.cachedState && now - this.lastStateCache < this.CACHE_DURATION) {
+      return this.cachedState;
+    }
+    
+    const state = await this.db.toJSON();
+    this.cachedState = state;
+    this.lastStateCache = now;
+    return state;
+  }
+
+  // Clean up resources
+  async cleanup() {
+    try {
+      const now = Date.now();
+      
+      // Clear old sync tracking
+      for (const [peer, time] of this.lastSyncTime.entries()) {
+        if (now - time > 300000) { // 5 minutes
+          this.lastSyncTime.delete(peer);
+        }
+      }
+      
+      // Clear sync in progress for disconnected peers
+      for (const peer of this.syncInProgress) {
+        if (!Array.from(this.connections).some(s => s._peerNodeId === peer)) {
+          this.syncInProgress.delete(peer);
+        }
+      }
+      
+      // Clear cached state if too old
+      if (this.cachedState && now - this.lastStateCache > this.CACHE_DURATION) {
+        this.cachedState = null;
+      }
+      
+      this.lastCleanup = now;
+      
+      // Force garbage collection if available
+      if (global.gc) {
+        global.gc();
+      }
+    } catch (err) {
+      this.log('CLEANUP_ERROR', {
+        error: err.message,
+        stack: err.stack
+      });
+    }
+  }
+
+  // Handle incoming data from peers with better buffer management
   async handlePeerData(socket, _, data) {
     try {
-      const parsed = JSON.parse(data);
-      const peerId = parsed.senderNodeId || 'unknown';
+      // Get or create buffer for this socket
+      let buffer = this.socketBuffers.get(socket) || '';
+      buffer += data.toString('utf8');
       
-      // If successful, reset the buffer
-      this.stats.syncsReceived++;
-      
-      // Check if this is a sync request
-      if (parsed.requestSync) {
-        this.log('Received sync request from peer:', peerId);
-        await this.handleSyncRequest(socket);
+      // Check buffer size before processing
+      if (buffer.length > this.BUFFER_LIMIT) {
+        this.log('BUFFER_OVERFLOW', {
+          peerId: socket._peerNodeId || 'unknown',
+          bufferSize: buffer.length
+        });
+        buffer = '';
         return;
       }
       
-      // Instead of creating a new database instance, just merge the data directly
-      const changes = await this.db.merge({
-        entries: parsed.entries,
-        version: parsed.version,
-        lastModified: parsed.lastModified,
-        nodeId: peerId
-      });
-      
-      if (changes > 0) {
-        console.log(`Merged ${changes} changes from peer ${peerId}`);
-        await this.saveDatabase();
-        await this.listAllEntries();
+      try {
+        const parsed = JSON.parse(buffer);
+        // Clear buffer on successful parse
+        buffer = '';
         
-        this.stats.changesMerged += changes;
-        this.stats.lastChangeAt = new Date().toISOString();
+        const peerId = parsed.senderNodeId || 'unknown';
+        socket._peerNodeId = peerId;
+        socket._syncChain = parsed.syncChain || [];
         
-        // Notify other peers about our updated state
-        for (const otherSocket of this.connections) {
-          if (otherSocket !== socket && !otherSocket.destroyed) {
-            await this.handleSyncRequest(otherSocket);
+        this.stats.syncsReceived++;
+        
+        this.log('PEER_DATA', {
+          peerId,
+          messageType: parsed.requestSync ? 'sync_request' : 'data',
+          syncChain: socket._syncChain
+        });
+        
+        // Check if this is a sync request
+        if (parsed.requestSync) {
+          const trigger = parsed.trigger || 'request';
+          await this.handleSyncRequest(socket, `peer_request_${trigger}`);
+          return;
+        }
+        
+        // Instead of creating a new database instance, just merge the data directly
+        const changes = await this.db.merge({
+          entries: parsed.entries,
+          version: parsed.version,
+          lastModified: parsed.lastModified,
+          nodeId: peerId
+        });
+        
+        this.log('MERGE_RESULT', {
+          peerId,
+          changes,
+          syncChain: socket._syncChain
+        });
+        
+        if (changes > 0) {
+          await this.saveDatabase();
+          await this.listAllEntries();
+          
+          this.stats.changesMerged += changes;
+          this.stats.lastChangeAt = new Date().toISOString();
+          
+          // Only notify a subset of peers about updates to prevent sync storms
+          const otherPeers = Array.from(this.connections)
+            .filter(s => s !== socket && !s.destroyed);
+          
+          // Select up to 3 random peers to notify
+          const peersToNotify = otherPeers
+            .sort(() => Math.random() - 0.5)
+            .slice(0, 3);
+          
+          this.log('NOTIFY_PEERS', {
+            peerId,
+            selectedPeers: peersToNotify.length,
+            totalPeers: otherPeers.length,
+            changes,
+            syncChain: socket._syncChain
+          });
+          
+          for (const otherSocket of peersToNotify) {
+            const otherPeerId = otherSocket._peerNodeId || 'unknown';
+            await this.handleSyncRequest(otherSocket, `changes_from_${peerId}`);
           }
         }
-      } else {
-        this.log('No new changes from peer');
+      } catch (parseErr) {
+        // Update buffer for next chunk
+        this.socketBuffers.set(socket, buffer);
       }
     } catch (err) {
-      console.error('Error processing peer data:', err);
+      this.log('PEER_DATA_ERROR', {
+        error: err.message,
+        stack: err.stack
+      });
       this.stats.errors++;
+      // Clear buffer on error
+      this.socketBuffers.delete(socket);
     }
   }
 
@@ -515,79 +738,65 @@ class P2PDBClient {
       this.topic = crypto.createHash('sha256').update(this.topicString).digest();
       console.log('Using topic:', this.topic.toString('hex'));
       
-      // Handle new connections
+      // Handle new connections with proper cleanup
       this.swarm.on('connection', (socket, info) => {
         try {
-          // We'll get the actual nodeId from the sync messages
           this.connections.add(socket);
           this.stats.connectionsTotal++;
           
-          // Initial sync - share our database state
-          this.handleSyncRequest(socket).catch(err => {
-            console.error('Error in initial sync:', err);
+          this.log('NEW_CONNECTION', {
+            peerId: socket._peerNodeId || 'unknown',
+            peerInfo: info
+          });
+          
+          // Initial sync
+          this.handleSyncRequest(socket, 'initial_connection').catch(err => {
+            this.log('INITIAL_SYNC_ERROR', {
+              error: err.message,
+              stack: err.stack
+            });
             this.stats.errors++;
           });
           
-          // Handle incoming data from peers
-          let buffer = '';
-          let peerNodeId = null;
-          
+          // Setup socket data handling
           socket.on('data', data => {
-            (async () => {
-              try {
-                buffer += data.toString('utf8');
-                
-                try {
-                  // Try to parse the buffer as JSON
-                  const parsed = JSON.parse(buffer);
-                  // If successful, reset the buffer
-                  buffer = '';
-                  
-                  // Update peer's nodeId if we receive it
-                  if (parsed.senderNodeId && !peerNodeId) {
-                    peerNodeId = parsed.senderNodeId;
-                    console.log('New peer connected:', peerNodeId);
-                  }
-                  
-                  await this.handlePeerData(socket, null, JSON.stringify(parsed));
-                } catch (parseErr) {
-                  // If we can't parse the JSON yet, it might be an incomplete message
-                  // We'll keep the buffer and wait for more data
-                  this.log('Could not parse buffer as JSON yet, waiting for more data');
-                  
-                  // But if the buffer gets too large, clear it to prevent memory issues
-                  if (buffer.length > 1000000) { // 1MB limit
-                    console.error('Buffer too large, clearing');
-                    buffer = '';
-                    this.stats.errors++;
-                  }
-                }
-              } catch (err) {
-                console.error('Error processing peer data:', err);
-                buffer = ''; // Reset buffer on error
-                this.stats.errors++;
-              }
-            })().catch(err => {
-              console.error('Error in data handler:', err);
+            this.handlePeerData(socket, null, data).catch(err => {
+              this.log('DATA_HANDLER_ERROR', {
+                error: err.message,
+                stack: err.stack
+              });
               this.stats.errors++;
             });
           });
           
-          // Handle disconnection
+          // Cleanup on socket close
           socket.on('close', () => {
-            if (peerNodeId) {
-              console.log('Peer disconnected:', peerNodeId);
+            if (socket._peerNodeId) {
+              this.log('PEER_DISCONNECTED', {
+                peerId: socket._peerNodeId
+              });
             }
             this.connections.delete(socket);
+            this.socketBuffers.delete(socket);
+            this.syncInProgress.delete(socket._peerNodeId);
           });
           
           socket.on('error', (err) => {
-            console.error('Socket error:', err);
+            this.log('SOCKET_ERROR', {
+              error: err.message,
+              peerId: socket._peerNodeId
+            });
             this.connections.delete(socket);
+            this.socketBuffers.delete(socket);
+            this.syncInProgress.delete(socket._peerNodeId);
             this.stats.errors++;
           });
+          
         } catch (err) {
-          console.error('Error handling connection:', err);
+          this.log('CONNECTION_HANDLER_ERROR', {
+            error: err.message,
+            stack: err.stack
+          });
           this.stats.errors++;
         }
       });
@@ -629,6 +838,16 @@ class P2PDBClient {
         }
       }, 30000);
       
+      // Add periodic cleanup
+      this.cleanupInterval = setInterval(() => {
+        this.cleanup().catch(err => {
+          this.log('CLEANUP_INTERVAL_ERROR', {
+            error: err.message,
+            stack: err.stack
+          });
+        });
+      }, this.CLEANUP_INTERVAL);
+      
       console.log('\nDatabase ready for use.');
       console.log('You can now add, update, or delete entries via the API.');
       console.log('Changes will automatically be synced with peers.');
@@ -641,7 +860,7 @@ class P2PDBClient {
     }
   }
   
-  // Stop the P2P network
+  // Stop the P2P network with proper cleanup
   async stop() {
     try {
       console.log('\nClosing...');
@@ -650,9 +869,20 @@ class P2PDBClient {
         clearInterval(this.syncInterval);
       }
       
+      if (this.cleanupInterval) {
+        clearInterval(this.cleanupInterval);
+      }
+      
+      // Clear all buffers and tracking
       for (const socket of this.connections) {
+        this.socketBuffers.delete(socket);
         socket.destroy();
       }
+      
+      this.connections.clear();
+      this.syncInProgress.clear();
+      this.lastSyncTime.clear();
+      this.cachedState = null;
       
       // Save final state and close database
       await this.saveDatabase();
