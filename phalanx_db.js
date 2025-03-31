@@ -109,29 +109,61 @@ class P2PDatabase {
         // *** NEW: Load metadata after opening ***
         try {
           const storedVersion = await this.db.get(this.METADATA_VERSION_KEY);
-          this.version = storedVersion;
-          console.log(`Loaded existing DB version: ${this.version}`);
+          // Check if the loaded value is a valid number
+          if (typeof storedVersion === 'number' && !isNaN(storedVersion)) {
+            this.version = storedVersion;
+            console.log(`Loaded existing DB version: ${this.version}`);
+          } else {
+            // Loaded value is invalid or not a number
+            const originalValue = storedVersion; // Capture for logging
+            this.version = 0; // Default to 0
+            console.warn(`Invalid or non-numeric stored version value encountered ('${originalValue}'). Defaulting to version 0.`);
+            // Overwrite the invalid value in the DB with the valid default
+            await this.db.put(this.METADATA_VERSION_KEY, this.version);
+            console.log('Corrected invalid version value in database.');
+          }
         } catch (err) {
           if (err.notFound) {
-            console.log('No existing DB version found, starting at 0.');
-            // Optionally write initial metadata if not found
-            await this.db.batch()
-              .put(this.METADATA_VERSION_KEY, this.version)
-              .put(this.METADATA_LAST_MODIFIED_KEY, this.lastModified)
-              .write();
+            console.log('No existing DB version found, starting at 0 and writing to DB.');
+            // The initial value (0) set in the constructor is already assigned.
+            // Write initial metadata if not found to ensure consistency
+            await this.db.put(this.METADATA_VERSION_KEY, this.version);
+            // We'll write lastModified below, no need to do a full batch here now
           } else {
             console.error('Error loading DB version:', err);
-            throw err; // Re-throw other errors
+            // Fallback to 0 on other load errors
+            this.version = 0;
+            console.warn(`Using version 0 due to error loading version.`);
           }
         }
         try {
            const storedLastModified = await this.db.get(this.METADATA_LAST_MODIFIED_KEY);
-           this.lastModified = storedLastModified;
-           console.log(`Loaded existing DB lastModified: ${new Date(this.lastModified).toISOString()}`);
+           // Check if the loaded value is a valid time value
+           if (storedLastModified !== undefined && storedLastModified !== null && !isNaN(new Date(storedLastModified).getTime())) {
+             this.lastModified = storedLastModified;
+             // Only log with toISOString if it's valid
+             console.log(`Loaded existing DB lastModified: ${new Date(this.lastModified).toISOString()}`);
+           } else {
+             // Loaded value is invalid or couldn't be parsed as a Date
+             const originalValue = storedLastModified; // Capture for logging
+             this.lastModified = Date.now(); // Default to current time
+             console.warn(`Invalid or unparseable stored lastModified value encountered ('${originalValue}'). Defaulting to current time: ${new Date(this.lastModified).toISOString()}`);
+             // Overwrite the invalid value in the DB with the valid default
+             await this.db.put(this.METADATA_LAST_MODIFIED_KEY, this.lastModified);
+             console.log('Corrected invalid lastModified value in database.');
+           }
         } catch (err) {
-             if (!err.notFound) { // Ignore notFound, initial value is set above
+             if (err.notFound) {
+               // Key not found, the initial value (Date.now()) set in the constructor is already assigned.
+               console.log('No existing DB lastModified found, using current time and writing to DB.');
+               // Add the key if it's missing to prevent future notFound errors and ensure consistency
+               await this.db.put(this.METADATA_LAST_MODIFIED_KEY, this.lastModified);
+             } else {
+               // Other error during loading
                console.error('Error loading DB lastModified:', err);
-               // Decide if this is fatal, maybe proceed with current timestamp
+               // Fallback to current time even on other load errors? Yes, probably safest.
+               this.lastModified = Date.now();
+               console.warn(`Using current time due to error loading lastModified.`);
              }
         }
         // *** END NEW ***
