@@ -774,54 +774,101 @@ class P2PDBClient {
               this.log('PEER_VERSION_UPDATE', { peerId: peerId, version: parsed.version }); // Log version updates
           }
           
-          // --- Merge Logic ---
-          this.db.log = this.log.bind(this); 
+          // --- Check if we need to request a full sync based on metadata ---
+          const remoteVersion = parsed.version;
+          const remoteLastModified = parsed.lastModified;
+          const localVersion = this.db.version;
+          const localLastModified = this.db.lastModified;
 
-          let changes = 0;
-          const remoteDbState = {
-              entries: parsed.entries || {}, 
-              version: parsed.version,
-              lastModified: parsed.lastModified, 
-              nodeId: peerId // Use the authoritative peerId
-          };
+          if (!parsed.entries && // Only act on metadata-only messages or potentially empty full messages
+              (remoteVersion > localVersion || remoteLastModified > localLastModified)) {
+              
+              // Check cooldown before requesting again from this specific peer
+              const now = Date.now();
+              const lastSyncReqTime = socket._lastSyncRequestTime || 0; // Track last request time on the socket
+              const syncRequestCooldown = 10000; // e.g., 10 seconds cooldown for requesting
 
-          changes = await this.db.merge(remoteDbState);
+              if (now - lastSyncReqTime > syncRequestCooldown) {
+                  this.log('REQUESTING_SYNC_FROM_PEER', {
+                      peerId,
+                      reason: 'remote_newer_metadata',
+                      remoteVersion, remoteLastModified,
+                      localVersion, localLastModified
+                  });
 
-          delete this.db.log; 
-          // --- End Merge Logic ---
-
-          this.log('MERGE_RESULT', { 
-              peerId, // Use authoritative peerId
-              changes,
-              newLocalVersion: this.db.version, 
-              syncChain: socket._syncChain
-          });
-
-          if (changes > 0) {
-              console.log(`Merged ${changes} changes from ${peerId}. New version: ${this.db.version}`);
-              this.stats.changesMerged += changes;
-              this.stats.lastChangeAt = new Date().toISOString();
-
-              // Notify peers logic
-              const otherPeers = Array.from(this.connections)
-                  .filter(s => s !== socket && !s.destroyed);
-              let peersToNotify = otherPeers;
-              if (otherPeers.length > 3) {
-                  peersToNotify = otherPeers.sort(() => Math.random() - 0.5).slice(0, 3);
+                  const requestPayload = {
+                      requestSync: true,
+                      senderNodeId: this.nodeId,
+                      trigger: 'metadata_update_request',
+                      syncChain: parsed.syncChain || [] // Pass along the chain
+                  };
+                  socket.write(JSON.stringify(requestPayload));
+                  socket._lastSyncRequestTime = now; // Update last request time
+                  
+                  // Since we requested a sync, we don't need to proceed with merging *this* metadata message
+                  // The peer will send back a full state shortly.
+                  return; 
+              } else {
+                  this.log('REQUEST_SYNC_SKIPPED', {
+                      peerId,
+                      reason: 'request_cooldown',
+                      timeSinceLastReq: now - lastSyncReqTime
+                  });
               }
-              
-              this.log('NOTIFY_PEERS', {
-                  sourcePeerId: peerId, // Use authoritative peerId
-                  peerCount: peersToNotify.length,
-                  totalPeers: otherPeers.length,
+          }
+          // --- End Check ---
+
+          // --- Merge Logic --- 
+          // If we received entries (full state), proceed to merge
+          if (parsed.entries) {
+              this.db.log = this.log.bind(this); 
+
+              let changes = 0;
+              const remoteDbState = {
+                  entries: parsed.entries || {}, 
+                  version: parsed.version,
+                  lastModified: parsed.lastModified, 
+                  nodeId: peerId // Use the authoritative peerId
+              };
+
+              changes = await this.db.merge(remoteDbState);
+
+              delete this.db.log; 
+              // --- End Merge Logic ---
+
+              this.log('MERGE_RESULT', { 
+                  peerId, // Use authoritative peerId
                   changes,
-                  syncChain: socket._syncChain 
+                  newLocalVersion: this.db.version, 
+                  syncChain: socket._syncChain
               });
-              
-              for (const otherSocket of peersToNotify) {
-                  // The handleSyncRequest call here will use otherSocket._peerNodeId for its lookup,
-                  // which should have been updated if data was received from that peer.
-                   await this.handleSyncRequest(otherSocket, `changes_from_${peerId}`); // Pass authoritative source peerId
+
+              if (changes > 0) {
+                  console.log(`Merged ${changes} changes from ${peerId}. New version: ${this.db.version}`);
+                  this.stats.changesMerged += changes;
+                  this.stats.lastChangeAt = new Date().toISOString();
+
+                  // Notify peers logic
+                  const otherPeers = Array.from(this.connections)
+                      .filter(s => s !== socket && !s.destroyed);
+                  let peersToNotify = otherPeers;
+                  if (otherPeers.length > 3) {
+                      peersToNotify = otherPeers.sort(() => Math.random() - 0.5).slice(0, 3);
+                  }
+                  
+                  this.log('NOTIFY_PEERS', {
+                      sourcePeerId: peerId, // Use authoritative peerId
+                      peerCount: peersToNotify.length,
+                      totalPeers: otherPeers.length,
+                      changes,
+                      syncChain: socket._syncChain 
+                  });
+                  
+                  for (const otherSocket of peersToNotify) {
+                      // The handleSyncRequest call here will use otherSocket._peerNodeId for its lookup,
+                      // which should have been updated if data was received from that peer.
+                       await this.handleSyncRequest(otherSocket, `changes_from_${peerId}`); // Pass authoritative source peerId
+                  }
               }
           }
 
@@ -967,7 +1014,7 @@ class P2PDBClient {
       this.syncInterval = setInterval(() => {
         if (this.connections.size > 0) {
           //console.log('Performing periodic sync...');
-          //this.syncWithPeers();
+          this.syncWithPeers('periodic'); // Pass 'periodic' trigger
         }
       }, 30000);
       
@@ -1105,7 +1152,7 @@ class P2PDBClient {
         // await this.listAllEntries(); // NOTE: listAllEntries still loads all entries for display. Consider removing if not essential.
         
         // Notify peers of the change
-        //this.syncWithPeers();
+        await this.syncWithPeers(`add_${infohashService}`);
       }
       
       return result;
@@ -1135,7 +1182,7 @@ class P2PDBClient {
         // await this.listAllEntries(); // NOTE: listAllEntries still loads all entries for display. Consider removing if not essential.
         
         // Notify peers of the change
-        //this.syncWithPeers();
+        await this.syncWithPeers(`update_${infohashService}`);
       } else {
         console.error(`Entry not found: ${infohashService}`);
       }
@@ -1158,7 +1205,7 @@ class P2PDBClient {
         // await this.listAllEntries(); // NOTE: listAllEntries still loads all entries for display. Consider removing if not essential.
         
         // Notify peers of the change
-        //this.syncWithPeers();
+        await this.syncWithPeers(`delete_${infohashService}`);
       } else {
         console.error(`Entry not found: ${infohashService}`);
       }
@@ -1307,6 +1354,30 @@ class P2PDBClient {
     }
     
     return results;
+  }
+
+  // Function to sync database state with all connected peers
+  async syncWithPeers(trigger = 'local_change') {
+    this.log('SYNC_TRIGGERED', { trigger, peerCount: this.connections.size });
+    for (const socket of this.connections) {
+      if (!socket.destroyed) {
+        // Use the peerId associated with the socket for logging/checks if available
+        const peerId = socket._peerNodeId || 'unknown';
+        try {
+          // Pass the trigger reason to handleSyncRequest
+          await this.handleSyncRequest(socket, trigger);
+        } catch (err) {
+          this.log('SYNC_PEER_ERROR', { peerId, trigger, error: err.message });
+          this.stats.errors++;
+          // Decide if we should remove the connection on error, e.g.:
+          // this.connections.delete(socket);
+          // socket.destroy();
+        }
+      } else {
+        // Clean up destroyed sockets if they are still in the set
+        this.connections.delete(socket);
+      }
+    }
   }
 }
 
