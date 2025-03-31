@@ -73,6 +73,10 @@ class P2PDatabase {
     this.db = null;
     this.version = 0;
     this.lastModified = Date.now();
+    
+    // Define keys for storing metadata within LevelDB
+    this.METADATA_VERSION_KEY = '__metadata_version__';
+    this.METADATA_LAST_MODIFIED_KEY = '__metadata_lastModified__';
   }
 
   // Initialize the database
@@ -101,7 +105,38 @@ class P2PDatabase {
       try {
         this.db = new Level(this.dbDir, { valueEncoding: 'json' });
         await this.db.open();
-        return;
+        
+        // *** NEW: Load metadata after opening ***
+        try {
+          const storedVersion = await this.db.get(this.METADATA_VERSION_KEY);
+          this.version = storedVersion;
+          console.log(`Loaded existing DB version: ${this.version}`);
+        } catch (err) {
+          if (err.notFound) {
+            console.log('No existing DB version found, starting at 0.');
+            // Optionally write initial metadata if not found
+            await this.db.batch()
+              .put(this.METADATA_VERSION_KEY, this.version)
+              .put(this.METADATA_LAST_MODIFIED_KEY, this.lastModified)
+              .write();
+          } else {
+            console.error('Error loading DB version:', err);
+            throw err; // Re-throw other errors
+          }
+        }
+        try {
+           const storedLastModified = await this.db.get(this.METADATA_LAST_MODIFIED_KEY);
+           this.lastModified = storedLastModified;
+           console.log(`Loaded existing DB lastModified: ${new Date(this.lastModified).toISOString()}`);
+        } catch (err) {
+             if (!err.notFound) { // Ignore notFound, initial value is set above
+               console.error('Error loading DB lastModified:', err);
+               // Decide if this is fatal, maybe proceed with current timestamp
+             }
+        }
+        // *** END NEW ***
+        
+        return; // Successfully opened and loaded metadata
       } catch (err) {
         retries--;
         if (err.code === 'LEVEL_LOCKED') {
@@ -142,6 +177,19 @@ class P2PDatabase {
     return entries;
   }
 
+  // Helper to update metadata properties and persist to DB
+  async _updateMetadata(batch) {
+      const newVersion = this.version + 1;
+      const newLastModified = Date.now();
+      
+      batch.put(this.METADATA_VERSION_KEY, newVersion);
+      batch.put(this.METADATA_LAST_MODIFIED_KEY, newLastModified);
+      
+      // Update in-memory values *after* successful write (will happen post-batch.write())
+      // We return the values to be set after the write succeeds.
+      return { newVersion, newLastModified };
+  }
+
   // Add an entry
   async addEntry(infohashService, cacheStatus, expiration) {
     if (!this.db) {
@@ -149,18 +197,29 @@ class P2PDatabase {
     }
 
     try {
-      await this.db.put(infohashService, {
+      const batch = this.db.batch();
+      const newEntry = {
         cacheStatus,
         timestamp: new Date().toISOString(),
         expiration: expiration || new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
         updatedBy: this.nodeId,
         deleted: false
-      });
-      this.version++;
-      this.lastModified = Date.now();
+      };
+      batch.put(infohashService, newEntry);
+      
+      // Add metadata updates to the batch
+      const { newVersion, newLastModified } = await this._updateMetadata(batch);
+
+      console.log(`[addEntry] Attempting to write version ${newVersion} for key ${infohashService}`);
+      await batch.write(); // Write entry and metadata atomically
+      console.log(`[addEntry] Successfully wrote batch for key ${infohashService}`);
+      
+      this.version = newVersion;
+      this.lastModified = newLastModified;
+
       return true;
     } catch (err) {
-      console.error('Error adding entry:', err);
+      console.error(`[addEntry] Error writing batch for key ${infohashService}:`, err);
       return false;
     }
   }
@@ -173,23 +232,34 @@ class P2PDatabase {
 
     try {
       const existingEntry = await this.db.get(infohashService).catch(() => null);
-      if (!existingEntry) {
-        return false;
+      if (!existingEntry || existingEntry.deleted) { // Also check if marked deleted
+        return false; // Don't update if non-existent or already deleted
       }
-
-      await this.db.put(infohashService, {
+      
+      const batch = this.db.batch();
+      const updatedEntry = {
         ...existingEntry,
-        cacheStatus: cacheStatus || existingEntry.cacheStatus,
+        cacheStatus: cacheStatus !== undefined ? cacheStatus : existingEntry.cacheStatus, // Allow updating only expiration
         timestamp: new Date().toISOString(),
         expiration: expiration || existingEntry.expiration,
-        updatedBy: this.nodeId
-      });
+        updatedBy: this.nodeId,
+        deleted: false // Ensure deleted flag is false on update
+      };
+      batch.put(infohashService, updatedEntry);
+
+      // Add metadata updates to the batch
+      const { newVersion, newLastModified } = await this._updateMetadata(batch);
       
-      this.version++;
-      this.lastModified = Date.now();
+      console.log(`[updateEntry] Attempting to write version ${newVersion} for key ${infohashService}`);
+      await batch.write(); // Write update and metadata atomically
+      console.log(`[updateEntry] Successfully wrote batch for key ${infohashService}`);
+
+      this.version = newVersion;
+      this.lastModified = newLastModified;
+
       return true;
     } catch (err) {
-      console.error('Error updating entry:', err);
+      console.error(`[updateEntry] Error writing batch for key ${infohashService}:`, err);
       return false;
     }
   }
@@ -206,18 +276,28 @@ class P2PDatabase {
         return false;
       }
 
-      await this.db.put(infohashService, {
+      const batch = this.db.batch();
+      const tombstoneEntry = {
         ...existingEntry,
         deleted: true,
         timestamp: new Date().toISOString(),
         updatedBy: this.nodeId
-      });
+      };
+      batch.put(infohashService, tombstoneEntry); // Overwrite with tombstone
+
+      // Add metadata updates to the batch
+      const { newVersion, newLastModified } = await this._updateMetadata(batch);
       
-      this.version++;
-      this.lastModified = Date.now();
+      console.log(`[deleteEntry] Attempting to write version ${newVersion} for key ${infohashService}`);
+      await batch.write(); // Write tombstone and metadata atomically
+      console.log(`[deleteEntry] Successfully wrote batch for key ${infohashService}`);
+      
+      this.version = newVersion;
+      this.lastModified = newLastModified;
+      
       return true;
     } catch (err) {
-      console.error('Error deleting entry:', err);
+      console.error(`[deleteEntry] Error writing batch for key ${infohashService}:`, err);
       return false;
     }
   }
@@ -229,83 +309,127 @@ class P2PDatabase {
     }
 
     let changes = 0;
-    
+    let requiresMetadataUpdate = false; // Flag to track if metadata needs saving
+
     try {
-      // Only apply changes if the other DB has a newer version
-      if (otherDb.version <= this.version && otherDb.lastModified <= this.lastModified) {
-        return changes;
-      }
-
-      // Get entries from both databases
-      const otherEntries = otherDb.entries || await otherDb._getAllEntries();
-      const currentEntries = await this._getAllEntries();
-      
-      // Merge entries based on timestamp - but respect tombstones
-      const batch = this.db.batch();
-      
-      for (const [key, entry] of Object.entries(otherEntries)) {
-        const existingEntry = currentEntries[key];
-        
-        if (!existingEntry || new Date(existingEntry.timestamp) < new Date(entry.timestamp)) {
-          batch.put(key, entry);
-          changes++;
+        // Compare versions AND lastModified for more robust change detection
+        if (otherDb.version <= this.version && otherDb.lastModified <= this.lastModified) {
+            this.log?.('MERGE_SKIPPED', { reason: 'remote_not_newer', localVersion: this.version, remoteVersion: otherDb.version, localMod: this.lastModified, remoteMod: otherDb.lastModified });
+            return changes;
         }
-      }
-      
-      if (changes > 0) {
-        await batch.write();
-        this.version = Math.max(this.version, otherDb.version) + 1;
-        this.lastModified = Date.now();
-      }
-      
-      return changes;
+
+        const otherEntries = otherDb.entries || await otherDb._getAllEntries(); // Assume otherDb might be from JSON
+        
+        // Use batch for merging entries
+        const batch = this.db.batch();
+        
+        for (const [key, remoteEntry] of Object.entries(otherEntries)) {
+            // Skip internal metadata keys if they somehow appear in entries
+            if (key === this.METADATA_VERSION_KEY || key === this.METADATA_LAST_MODIFIED_KEY) continue;
+
+            try {
+                const localEntry = await this.db.get(key).catch(() => null);
+
+                // Merge logic: remote is newer if no local entry OR remote timestamp is later
+                if (!localEntry || new Date(localEntry.timestamp) < new Date(remoteEntry.timestamp)) {
+                    batch.put(key, remoteEntry);
+                    changes++;
+                }
+            } catch (err) {
+                 // Log error getting local key during merge but continue if possible
+                 console.error(`Error getting local key ${key} during merge:`, err);
+            }
+        }
+
+        if (changes > 0) {
+            requiresMetadataUpdate = true; // Mark that we need to update metadata
+        }
+
+        // Determine the new metadata values *before* writing the batch
+        const newVersion = Math.max(this.version, otherDb.version) + (changes > 0 ? 1 : 0); // Increment only if changes were made
+        const newLastModified = Date.now(); // Always update lastModified if merging potentially newer data
+
+        // Add metadata to the batch *if* version or changes occurred
+        // Always update lastModified if the remote had a newer timestamp, even if no entries changed locally
+         if (newVersion > this.version || otherDb.lastModified > this.lastModified) {
+             batch.put(this.METADATA_VERSION_KEY, newVersion);
+             batch.put(this.METADATA_LAST_MODIFIED_KEY, newLastModified);
+             requiresMetadataUpdate = true; // Ensure flag is set if only version/timestamp changes
+             console.log(`[merge] Metadata update triggered. Writing version: ${newVersion}`);
+         } else {
+             console.log(`[merge] Metadata update not triggered. Local version: ${this.version}, Remote version: ${otherDb.version}, Changes: ${changes}, Remote lastModified <= Local lastModified.`);
+         }
+
+
+        // Write the batch if there were entry changes OR metadata updates needed
+        if (changes > 0 || requiresMetadataUpdate) {
+            console.log(`[merge] Attempting to write batch. Changes: ${changes}, MetadataUpdate: ${requiresMetadataUpdate}`);
+            await batch.write();
+            console.log(`[merge] Successfully wrote batch. New version in memory will be: ${newVersion}`);
+
+            // Update in-memory state *after* successful write
+            this.version = newVersion;
+            this.lastModified = newLastModified;
+        } else {
+             this.log?.('MERGE_INFO', { reason: 'no_newer_entries_or_metadata', localVersion: this.version, remoteVersion: otherDb.version });
+        }
+
+        return changes; // Return number of entries changed/added
     } catch (err) {
-      console.error('Error during merge:', err);
-      return 0;
+        console.error('[merge] Error during merge process:', err);
+        // Attempt to log using the client's logger if available (passed via context or DI)
+        this.log?.('MERGE_ERROR', { error: err.message, stack: err.stack });
+        return 0; // Return 0 changes on error
     }
-  }
+}
 
-  // Export as JSON
+  // Export as JSON (includes metadata from memory)
   async toJSON() {
-    if (!this.db) {
-      throw new Error('Database not initialized');
-    }
-
+    if (!this.db) throw new Error('Database not initialized');
     const entries = await this._getAllEntries();
+    // Filter out internal metadata keys from the entries export
+    delete entries[this.METADATA_VERSION_KEY];
+    delete entries[this.METADATA_LAST_MODIFIED_KEY];
     return {
       entries,
-      version: this.version,
-      lastModified: this.lastModified,
+      version: this.version, // Use in-memory version
+      lastModified: this.lastModified, // Use in-memory lastModified
       nodeId: this.nodeId
     };
   }
 
-  // Create from JSON
+  // Create from JSON - Less critical now, but ensure it writes metadata if used
   static async fromJSON(json, sourceNodeId) {
     const db = new P2PDatabase(sourceNodeId || json.nodeId || nodeId);
     try {
-      await db.open();
+      await db.open(); // Open first (which might load existing metadata)
       
       const entries = json.entries || {};
-      
-      // Batch write all entries
       const batch = db.db.batch();
+      let entryCount = 0;
       for (const [key, value] of Object.entries(entries)) {
-        if (key !== '__test__') { // Skip test key
-          batch.put(key, value);
-        }
+         // Skip internal metadata keys if present in the JSON entries
+         if (key === db.METADATA_VERSION_KEY || key === db.METADATA_LAST_MODIFIED_KEY) continue;
+         if (key !== '__test__') {
+             batch.put(key, value);
+             entryCount++;
+         }
       }
-      await batch.write();
       
-      db.version = json.version || 0;
+      // Use version/lastModified from JSON, overriding what open() might have loaded
+      db.version = json.version || 0; 
       db.lastModified = json.lastModified || Date.now();
+      
+      // Write metadata from JSON to the DB as well
+      batch.put(db.METADATA_VERSION_KEY, db.version);
+      batch.put(db.METADATA_LAST_MODIFIED_KEY, db.lastModified);
+      
+      await batch.write(); // Write entries and metadata
+      
+      console.log(`Created DB from JSON. Wrote ${entryCount} entries. Version: ${db.version}`);
       return db;
     } catch (err) {
-      console.error('Error creating database from JSON:', err);
-      if (db.db) {
-        await db.close().catch(console.error);
-      }
-      throw err;
+       // ... existing error handling ...
     }
   }
 
@@ -388,9 +512,12 @@ class P2PDBClient {
   
   async initializeDatabase() {
     try {
-      this.db = await this.loadDatabase();
-      console.log('Database initialized with version:', this.db.version);
-      await this.saveDatabase();
+      // Directly create and open the LevelDB database.
+      // This avoids loading the entire dataset from a JSON file into memory at startup.
+      this.db = new P2PDatabase(this.nodeId);
+      await this.db.open(); // Open the LevelDB store directly
+      console.log('Database initialized directly from LevelDB storage. Version:', this.db.version);
+      // No need to call saveDatabase() here on startup.
     } catch (err) {
       console.error('Error initializing database:', err);
       throw err;
@@ -431,55 +558,43 @@ class P2PDBClient {
     return path.join(this.storageDir, `db-${this.nodeId}.json`);
   }
   
-  // Function to save database to disk
+  // Function to save database snapshot to disk
+  // NOTE: This function still loads the entire database into memory via toJSON()
+  // Call it judiciously (e.g., on shutdown or for manual backups).
   async saveDatabase() {
-    const data = JSON.stringify(await this.db.toJSON(), null, 2);
-    fs.writeFileSync(this.getSaveFilePath(), data);
-    console.log('Saved database to disk');
-  }
-  
-  // Function to load database from disk
-  async loadDatabase() {
     try {
-      if (fs.existsSync(this.getSaveFilePath())) {
-        const data = fs.readFileSync(this.getSaveFilePath(), 'utf8');
-        return await P2PDatabase.fromJSON(JSON.parse(data), this.nodeId);
-      }
+      const dbJson = await this.db.toJSON(); // This loads all entries into memory!
+      const data = JSON.stringify(dbJson, null, 2);
+      fs.writeFileSync(this.getSaveFilePath(), data);
+      console.log('Saved database snapshot to disk:', this.getSaveFilePath());
     } catch (err) {
-      console.error('Error loading database:', err);
+        console.error('Error saving database snapshot:', err);
     }
-    
-    const db = new P2PDatabase(this.nodeId);
-    await db.open();
-    return db;
   }
   
   // Function to list all entries
   async listAllEntries() {
-
-    
     const entries = await this.db._getAllEntries();
-
     console.log('Last modified:', new Date(this.db.lastModified).toISOString());
-
-    
     return entries;
   }
   
   // Function to handle sync with a new peer
   async handleSyncRequest(socket, trigger = 'unknown') {
+    // Get the most reliable peer ID we have for this socket *at this moment*.
+    // It might be 'unknown' initially. The check relies on this possibly stale ID.
+    const peerIdForLookup = socket._peerNodeId || 'unknown'; 
+    
     try {
-      const peerId = socket._peerNodeId || 'unknown';
-      
       // Optimization: Prevent sync loops - check if we've recently synced with this peer
       const now = Date.now();
-      const lastSyncTime = this.lastSyncTimes.get(peerId) || 0;
+      const lastSyncTime = this.lastSyncTimes.get(peerIdForLookup) || 0;
       
       // Skip if we've synced with this peer recently unless this is an initial connection
       if (trigger !== 'initial_connection' && 
           now - lastSyncTime < this.syncCooldown) {
         this.log('SYNC_SKIPPED', {
-          peerId,
+          peerId: peerIdForLookup,
           trigger,
           reason: 'cooldown',
           timeSinceLastSync: now - lastSyncTime
@@ -493,7 +608,7 @@ class P2PDBClient {
       // Check if our ID is already in the chain (prevent sync loops)
       if (syncChain.includes(this.nodeId)) {
         this.log('SYNC_SKIPPED', {
-          peerId,
+          peerId: peerIdForLookup,
           trigger,
           reason: 'loop_detected',
           syncChain: syncChain
@@ -505,64 +620,84 @@ class P2PDBClient {
       socket._syncChain = [...syncChain, this.nodeId];
       
       this.log('SYNC_START', {
-        peerId,
+        peerId: peerIdForLookup,
         trigger,
         syncChain: socket._syncChain,
         activeConnections: this.connections.size
       });
       
-      // Get current database state
-      const dbState = await this.db.toJSON();
-      
-      // Optimization: Skip sync if we know peer already has this version
-      const peerLastVersion = this.peerVersions.get(peerId) || 0;
-      if (trigger !== 'initial_connection' && 
-          peerLastVersion >= dbState.version) {
-        this.log('SYNC_SKIPPED', {
-          peerId,
-          trigger,
-          reason: 'version_match',
-          localVersion: dbState.version,
-          peerVersion: peerLastVersion
-        });
-        return;
+      // *** Use consistent peerIdForLookup for version check ***
+      const currentVersion = this.db.version;
+      const currentLastModified = this.db.lastModified;
+      // Get the last known version using the ID associated with the socket
+      const peerLastVersion = this.peerVersions.get(peerIdForLookup) || 0; 
+
+      let messagePayload;
+      let messageType = 'metadata_only'; 
+
+      // Decide based on the potentially stale peerLastVersion from the map
+      if (trigger === 'initial_connection' || currentVersion > peerLastVersion) {
+        this.log('SYNC_PREPARING_FULL', { peerId: peerIdForLookup, trigger, localVersion: currentVersion, peerKnownVersion: peerLastVersion });
+        messageType = 'full_state';
+        const dbState = await this.db.toJSON(); 
+        messagePayload = {
+          ...dbState, 
+          senderNodeId: this.nodeId, // Send our actual ID
+          syncChain: socket._syncChain 
+        };
+      } else {
+        this.log('SYNC_PREPARING_METADATA', { peerId: peerIdForLookup, trigger, localVersion: currentVersion, peerKnownVersion: peerLastVersion });
+        messagePayload = {
+          senderNodeId: this.nodeId, // Send our actual ID
+          syncChain: socket._syncChain,
+          version: currentVersion,
+          lastModified: currentLastModified,
+          entries: null 
+        };
       }
-      
-      // Add our nodeId to the message
-      const message = JSON.stringify({
-        ...dbState,
-        senderNodeId: this.nodeId,
-        syncChain: socket._syncChain
+      // *** END CHANGE ***
+
+      this.log('SYNC_START', { 
+        peerId: peerIdForLookup, // Log the ID used for the check
+        trigger,
+        messageType, 
+        syncChain: socket._syncChain,
+        activeConnections: this.connections.size
       });
+            
+      const message = JSON.stringify(messagePayload);
       
       socket.write(message);
       this.stats.syncsSent++;
       this.stats.lastSyncAt = new Date().toISOString();
       
-      // Update the last sync time for this peer
-      this.lastSyncTimes.set(peerId, now);
+      // Update lastSyncTimes using the same potentially 'unknown' ID for consistency with the check
+      this.lastSyncTimes.set(peerIdForLookup, Date.now()); 
       
       this.log('SYNC_SENT', {
-        peerId,
+        peerId: peerIdForLookup, // Log the ID used for check/sync time
         trigger,
+        messageType,
         dataSize: message.length,
         syncChain: socket._syncChain,
-        version: dbState.version
+        version: currentVersion 
       });
       
       // For initial connections only, request state back after a delay
       if (trigger === 'initial_connection') {
         setTimeout(() => {
           if (!socket.destroyed) {
-            socket.write(JSON.stringify({ 
+            const requestPayload = { 
               requestSync: true,
-              senderNodeId: this.nodeId,
+              senderNodeId: this.nodeId, 
               trigger: 'response_request',
-              syncChain: socket._syncChain
-            }));
+              syncChain: socket._syncChain 
+            };
+            socket.write(JSON.stringify(requestPayload));
             
             this.log('SYNC_REQUEST', {
-              peerId,
+              // Log the peer we are requesting from, ID might still be unknown here
+              peerId: socket._peerNodeId || 'unknown', 
               trigger: 'response_request',
               syncChain: socket._syncChain
             });
@@ -570,7 +705,8 @@ class P2PDBClient {
         }, 500);
       }
     } catch (err) {
-      this.log('SYNC_ERROR', {
+       this.log('SYNC_ERROR', {
+        peerId: socket._peerNodeId || 'unknown', 
         error: err.message,
         stack: err.stack,
         trigger
@@ -581,146 +717,124 @@ class P2PDBClient {
   
   // Handle incoming data from peers
   async handlePeerData(socket, _, data) {
-    try {
-      const parsed = JSON.parse(data);
-      const peerId = parsed.senderNodeId || 'unknown';
-      socket._peerNodeId = peerId;
-      socket._syncChain = parsed.syncChain || [];
+      // Default peerId from socket, might be 'unknown'
+      let currentPeerId = socket._peerNodeId || 'unknown'; 
       
-      this.stats.syncsReceived++;
-      
-      this.log('PEER_DATA', {
-        peerId,
-        messageType: parsed.requestSync ? 'sync_request' : 'data',
-        syncChain: socket._syncChain
-      });
-      
-      // Check if this is a sync request
-      if (parsed.requestSync) {
-        const trigger = parsed.trigger || 'request';
-        await this.handleSyncRequest(socket, `peer_request_${trigger}`);
-        return;
-      }
-      
-      // Store peer's DB version
-      if (parsed.version !== undefined) {
-        this.peerVersions.set(peerId, parsed.version);
-      }
-      
-      // Fast version check - if our version is newer, we don't need to merge
-      if (this.db.version > parsed.version) {
-        this.log('MERGE_SKIPPED', {
-          reason: 'local_newer',
-          localVersion: this.db.version,
-          peerVersion: parsed.version
-        });
-        return;
-      }
-      
-      // Optimization: Incremental merging for large databases
-      // This avoids loading the entire database into memory at once
-      let changes = 0;
-      
-      // Process entries in batches to avoid memory spikes
-      if (parsed.entries) {
-        const batchSize = 50;
-        const entries = Object.entries(parsed.entries);
-        const batches = Math.ceil(entries.length / batchSize);
-        
-        this.log('MERGE_START', {
-          entriesCount: entries.length,
-          batches
-        });
-        
-        for (let i = 0; i < batches; i++) {
-          const start = i * batchSize;
-          const end = Math.min(start + batchSize, entries.length);
-          const batchEntries = entries.slice(start, end);
+      try {
+          const parsed = JSON.parse(data);
           
-          let batchChanges = 0;
-          for (const [key, entry] of batchEntries) {
-            try {
-              // Get current value
-              const existingEntry = await this.db.db.get(key).catch(() => null);
-              
-              // Only update if the received entry is newer
-              if (!existingEntry || 
-                  new Date(existingEntry.timestamp) < new Date(entry.timestamp)) {
-                await this.db.db.put(key, entry);
-                batchChanges++;
+          // *** Prioritize senderNodeId from the message for all subsequent operations ***
+          const messageSenderId = parsed.senderNodeId;
+          let peerId = currentPeerId; // Start with socket's known ID
+
+          if (messageSenderId) {
+              // If the message has an ID, ALWAYS use it.
+              peerId = messageSenderId; 
+              if (messageSenderId !== currentPeerId) {
+                  // If it differs from the socket's known ID, update the socket's record
+                  socket._peerNodeId = messageSenderId;
+                  this.log('PEER_ID_UPDATED', { connectionId: 'SocketAssociation', oldId: currentPeerId, newId: messageSenderId });
+                  
+                  // Optional: Clean up old 'unknown' or incorrect entries if messageSenderId was previously associated differently
+                  if (currentPeerId !== 'unknown') {
+                     this.lastSyncTimes.delete(currentPeerId);
+                     this.peerVersions.delete(currentPeerId);
+                  }
               }
-            } catch (err) {
-              this.log('MERGE_ENTRY_ERROR', {
-                key,
-                error: err.message
-              });
-            }
+          } else if (peerId === 'unknown') {
+              // Still unknown and message has no ID - this is problematic
+              this.log('PEER_DATA_WARNING', { message: "Received data without senderNodeId from unidentified peer. Ignoring.", rawDataSample: data.toString('utf8').substring(0, 200) });
+              return; // Ignore data if we can't identify the sender
+          }
+          // From here, 'peerId' reliably holds the sender's ID if provided, or the socket's last known ID otherwise
+
+          socket._syncChain = parsed.syncChain || []; 
+          
+          this.stats.syncsReceived++;
+          
+          const messageType = parsed.entries ? 'full_state' : (parsed.requestSync ? 'sync_request' : 'metadata_only');
+
+          this.log('PEER_DATA', {
+              peerId, // Use the determined peerId
+              messageType,
+              syncChain: socket._syncChain,
+              dataSize: data.length 
+          });
+
+          if (parsed.requestSync) {
+              const trigger = parsed.trigger || 'request';
+              // Let handleSyncRequest use the (now hopefully updated) socket._peerNodeId
+              await this.handleSyncRequest(socket, `peer_request_${trigger}`); 
+              return;
+          }
+
+          // Update peerVersions map using the authoritative peerId
+          if (parsed.version !== undefined) {
+              this.peerVersions.set(peerId, parsed.version); 
+              this.log('PEER_VERSION_UPDATE', { peerId: peerId, version: parsed.version }); // Log version updates
           }
           
-          changes += batchChanges;
-          
-          this.log('MERGE_BATCH', {
-            batch: i + 1,
-            of: batches,
-            batchChanges,
-            totalChanges: changes
+          // --- Merge Logic ---
+          this.db.log = this.log.bind(this); 
+
+          let changes = 0;
+          const remoteDbState = {
+              entries: parsed.entries || {}, 
+              version: parsed.version,
+              lastModified: parsed.lastModified, 
+              nodeId: peerId // Use the authoritative peerId
+          };
+
+          changes = await this.db.merge(remoteDbState);
+
+          delete this.db.log; 
+          // --- End Merge Logic ---
+
+          this.log('MERGE_RESULT', { 
+              peerId, // Use authoritative peerId
+              changes,
+              newLocalVersion: this.db.version, 
+              syncChain: socket._syncChain
           });
-          
-          // Allow event loop to process other events
-          await new Promise(resolve => setTimeout(resolve, 0));
-        }
-        
-        // Update database version if we made changes
-        if (changes > 0) {
-          this.db.version = Math.max(this.db.version, parsed.version) + 1;
-          this.db.lastModified = Date.now();
-        }
+
+          if (changes > 0) {
+              console.log(`Merged ${changes} changes from ${peerId}. New version: ${this.db.version}`);
+              this.stats.changesMerged += changes;
+              this.stats.lastChangeAt = new Date().toISOString();
+
+              // Notify peers logic
+              const otherPeers = Array.from(this.connections)
+                  .filter(s => s !== socket && !s.destroyed);
+              let peersToNotify = otherPeers;
+              if (otherPeers.length > 3) {
+                  peersToNotify = otherPeers.sort(() => Math.random() - 0.5).slice(0, 3);
+              }
+              
+              this.log('NOTIFY_PEERS', {
+                  sourcePeerId: peerId, // Use authoritative peerId
+                  peerCount: peersToNotify.length,
+                  totalPeers: otherPeers.length,
+                  changes,
+                  syncChain: socket._syncChain 
+              });
+              
+              for (const otherSocket of peersToNotify) {
+                  // The handleSyncRequest call here will use otherSocket._peerNodeId for its lookup,
+                  // which should have been updated if data was received from that peer.
+                   await this.handleSyncRequest(otherSocket, `changes_from_${peerId}`); // Pass authoritative source peerId
+              }
+          }
+
+      } catch (err) {
+         this.log('PEER_DATA_ERROR', {
+              peerId: socket._peerNodeId || 'unknown', // Use socket's ID on error
+              error: err.message,
+              stack: err.stack,
+              rawDataSample: data.toString('utf8').substring(0, 200) 
+          });
+          this.stats.errors++;
+          if (this.db) delete this.db.log;
       }
-      
-      this.log('MERGE_RESULT', {
-        peerId,
-        changes,
-        syncChain: socket._syncChain
-      });
-      
-      if (changes > 0) {
-        await this.saveDatabase();
-        await this.listAllEntries();
-        
-        this.stats.changesMerged += changes;
-        this.stats.lastChangeAt = new Date().toISOString();
-        
-        // Optimization: Select only a subset of peers to notify
-        const otherPeers = Array.from(this.connections)
-          .filter(s => s !== socket && !s.destroyed);
-        
-        // Optimization: For large networks, only notify a random subset of peers
-        let peersToNotify = otherPeers;
-        if (otherPeers.length > 3) {
-          // Shuffle and take first 3 peers
-          peersToNotify = otherPeers.sort(() => Math.random() - 0.5).slice(0, 3);
-        }
-        
-        this.log('NOTIFY_PEERS', {
-          peerId,
-          peerCount: peersToNotify.length,
-          totalPeers: otherPeers.length,
-          changes,
-          syncChain: socket._syncChain
-        });
-        
-        for (const otherSocket of peersToNotify) {
-          const otherPeerId = otherSocket._peerNodeId || 'unknown';
-          await this.handleSyncRequest(otherSocket, `changes_from_${peerId}`);
-        }
-      }
-    } catch (err) {
-      this.log('PEER_DATA_ERROR', {
-        error: err.message,
-        stack: err.stack
-      });
-      this.stats.errors++;
-    }
   }
 
   // Start the P2P network
@@ -891,9 +1005,10 @@ class P2PDBClient {
       this.lastSyncTimes.clear();
       this.peerVersions.clear();
       
-      // Save final state and close database
-      await this.saveDatabase();
-      await this.db.close();
+      // Save final state snapshot and close database
+      console.log('Saving final database snapshot before closing...');
+      await this.saveDatabase(); // Save JSON snapshot on graceful shutdown
+      await this.db.close();     // Close the LevelDB instance
       
       if (this.swarm) {
         await this.swarm.destroy();
@@ -986,8 +1101,8 @@ class P2PDBClient {
       
       if (result) {
         console.log(`Added entry: ${infohashService}`);
-        await this.saveDatabase();
-        await this.listAllEntries();
+        // await this.saveDatabase(); // REMOVED: LevelDB persists automatically
+        // await this.listAllEntries(); // NOTE: listAllEntries still loads all entries for display. Consider removing if not essential.
         
         // Notify peers of the change
         //this.syncWithPeers();
@@ -1016,8 +1131,8 @@ class P2PDBClient {
       
       if (result) {
         console.log(`Updated entry: ${infohashService}`);
-        await this.saveDatabase();
-        await this.listAllEntries();
+        // await this.saveDatabase(); // REMOVED: LevelDB persists automatically
+        // await this.listAllEntries(); // NOTE: listAllEntries still loads all entries for display. Consider removing if not essential.
         
         // Notify peers of the change
         //this.syncWithPeers();
@@ -1039,8 +1154,8 @@ class P2PDBClient {
       
       if (result) {
         console.log(`Deleted entry: ${infohashService}`);
-        await this.saveDatabase();
-        await this.listAllEntries();
+        // await this.saveDatabase(); // REMOVED: LevelDB persists automatically
+        // await this.listAllEntries(); // NOTE: listAllEntries still loads all entries for display. Consider removing if not essential.
         
         // Notify peers of the change
         //this.syncWithPeers();
