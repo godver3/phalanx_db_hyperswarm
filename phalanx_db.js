@@ -182,7 +182,7 @@ class P2PDatabase {
     throw new Error('Failed to open database after multiple attempts');
   }
 
-  // Helper method to get all entries
+  // Helper method to get all entries (loads all into memory)
   async _getAllEntries() {
     if (!this.db) {
       throw new Error('Database not initialized');
@@ -193,7 +193,8 @@ class P2PDatabase {
     try {
       iterator = this.db.iterator();
       for await (const [key, value] of iterator) {
-        if (key !== '__test__') { // Skip test key
+        // Skip internal metadata keys and test key
+        if (key !== '__test__' && key !== this.METADATA_VERSION_KEY && key !== this.METADATA_LAST_MODIFIED_KEY) {
           entries[key] = value;
         }
       }
@@ -207,6 +208,38 @@ class P2PDatabase {
       }
     }
     return entries;
+  }
+
+  // *** NEW: Helper method to efficiently count active entries ***
+  async countActiveEntries() {
+    if (!this.db) {
+        throw new Error('Database not initialized');
+    }
+
+    let activeCount = 0;
+    let iterator;
+    try {
+        iterator = this.db.iterator({ values: true }); // Ensure values are loaded to check deleted flag
+        for await (const [key, value] of iterator) {
+            // Skip internal metadata keys and test key
+            if (key !== '__test__' && key !== this.METADATA_VERSION_KEY && key !== this.METADATA_LAST_MODIFIED_KEY) {
+                // Check if the entry exists and is not marked as deleted
+                if (value && !value.deleted) {
+                    activeCount++;
+                }
+            }
+        }
+    } catch (err) {
+        console.error('Error counting active entries:', err);
+        // Depending on requirements, you might want to return -1 or re-throw
+    } finally {
+        if (iterator) {
+            await iterator.close().catch(err => {
+                console.error('Error closing count iterator:', err);
+            });
+        }
+    }
+    return activeCount;
   }
 
   // Helper to update metadata properties and persist to DB
@@ -566,14 +599,14 @@ class P2PDBClient {
   
   // Get stats about the P2P connection
   async getStats() {
-    const entries = await this.db._getAllEntries();
-    const activeEntries = Object.entries(entries).filter(([_, entry]) => !entry.deleted).length;
+    // *** MODIFIED: Use countActiveEntries instead of loading all entries ***
+    const activeEntriesCount = await this.db.countActiveEntries();
     const memoryUsage = process.memoryUsage();
     return {
       ...this.stats,
       connectionsActive: this.connections.size,
       databaseVersion: this.db.version,
-      databaseEntries: activeEntries,
+      databaseEntries: activeEntriesCount, // Use the efficient count
       databaseLastModified: new Date(this.db.lastModified).toISOString(),
       nodeId: this.nodeId,
       memory: {
@@ -722,7 +755,8 @@ class P2PDBClient {
           this.stats.syncsReceived++;
 
           // Infer message type more robustly
-          const messageType = parsed.type || (parsed.entries ? 'full_state' : (parsed.requestSync ? 'sync_request' : 'metadata_only'));
+          const messageType = parsed.type || (parsed.entries ? 'full_state' : (parsed.requestSync ? 'sync_request' : (parsed.sequence ? 'sync_chunk' : (parsed.chunk ? 'sync_chunk' : (parsed.totalEntries !== undefined ? 'sync_end' : (parsed.version !== undefined ? 'metadata_only' : 'unknown')))))); // More robust inference
+
 
           this.log('PEER_DATA', {
               peerId,
@@ -800,108 +834,302 @@ class P2PDBClient {
           }
           // --- End Check ---
 
-          // --- Handle Incoming Chunks ---
+          // --- Handle Incoming Chunks with Direct Batching ---
+          const BATCH_WRITE_THRESHOLD = 1000; // Write batch every 1000 entries processed
+
           if (messageType === 'sync_start') {
-              socket._chunkBuffer = []; // Initialize buffer for this sync
-              // socket._expectedChunks = parsed.totalChunks; // We don't send totalChunks upfront anymore
-              socket._syncMeta = { // Store metadata associated with this sync
+              // Initialize state for chunked sync on the socket
+              socket._syncBatch = this.db.db.batch(); // LevelDB batch
+              socket._syncProcessedCounter = 0;       // Count entries processed in current batch
+              socket._syncTotalWrittenCounter = 0;   // Count total entries written in this sync
+              socket._syncInitialLocalVersion = this.db.version; // Store local state before merge
+              socket._syncInitialLocalLastModified = this.db.lastModified;
+              socket._syncRemoteMeta = { // Store metadata associated with this sync
                   version: parsed.version,
                   lastModified: parsed.lastModified
               };
-              this.log('SYNC_CHUNK_START', { peerId });
+              this.log('SYNC_CHUNK_START_BATCHING', {
+                  peerId,
+                  remoteVersion: parsed.version,
+                  remoteLastModified: parsed.lastModified,
+                  initialLocalVersion: socket._syncInitialLocalVersion,
+                  initialLocalLastModified: socket._syncInitialLocalLastModified
+              });
               return; // Wait for chunks
           }
 
           if (messageType === 'sync_chunk') {
-              if (!socket._chunkBuffer) {
-                  this.log('SYNC_CHUNK_ERROR', { peerId, error: 'Received chunk before sync_start' });
-                  // Consider closing the connection or requesting again if this happens
-                  return; // Ignore orphan chunk
+              let currentBatchForChunk = socket._syncBatch; // Get reference to the batch active *at the start* of processing this chunk
+
+              // Check if a batch exists when the chunk arrives
+              if (!currentBatchForChunk) {
+                  this.log('SYNC_CHUNK_ERROR_BATCHING', { peerId, error: 'Received chunk but no sync batch active (sync likely ended/errored)' });
+                  return; // Ignore orphan or late chunk
               }
-              // TODO: Add sequence number checking for robustness if needed
-              socket._chunkBuffer.push(...parsed.chunk); // Append entries from chunk
-              this.log('SYNC_CHUNK_RECEIVED', { peerId, sequence: parsed.sequence, chunkSize: parsed.chunk.length, bufferSize: socket._chunkBuffer.length });
-              return; // Wait for more chunks or end
-          }
+
+              const chunkEntries = parsed.chunk || [];
+              this.log('SYNC_CHUNK_RECEIVED_BATCHING', { peerId, sequence: parsed.sequence, chunkSize: chunkEntries.length });
+
+              let processingErrorOccurred = false; // Flag to stop processing on error
+
+              for (const entry of chunkEntries) {
+                  if (processingErrorOccurred) break; // Stop if previous iteration had error
+
+                  // Ensure entry is valid
+                  if (!entry || entry.key === undefined || entry.value === undefined ||
+                      entry.key === this.db.METADATA_VERSION_KEY || entry.key === this.db.METADATA_LAST_MODIFIED_KEY || entry.key === '__test__') {
+                      this.log('SYNC_CHUNK_WARNING_BATCHING', { peerId, message: 'Skipping invalid or internal entry in chunk', entryKey: entry?.key });
+                      continue;
+                  }
+
+                  // --- Process Entry ---
+                  try {
+                      const localEntry = await this.db.db.get(entry.key).catch(() => null);
+
+                      // --- PRIMARY CONCURRENCY CHECK ---
+                      // Check if sync_end has already run and nulled the main batch reference on the socket
+                      if (!socket._syncBatch) {
+                          this.log('SYNC_CHUNK_WARNING_BATCHING', { peerId, message: 'Sync ended concurrently before processing entry (socket ref null).', entryKey: entry.key });
+                          processingErrorOccurred = true;
+                          break; // Stop processing this chunk
+                      }
+                      // Check if an intermediate write replaced the batch reference *on the socket*.
+                      if (socket._syncBatch !== currentBatchForChunk) {
+                           this.log('SYNC_CHUNK_WARNING_BATCHING', { peerId, message: 'Batch replaced concurrently before processing entry (socket ref changed).', entryKey: entry.key });
+                           processingErrorOccurred = true;
+                           break; // Stop processing this chunk
+                      }
+                      // --- END PRIMARY CHECKS ---
+
+                      // Merge logic: remote is newer if no local entry OR remote timestamp is later
+                      if (!localEntry || new Date(localEntry.timestamp) < new Date(entry.value.timestamp)) {
+                          try {
+                              // *** Add put operation inside its own try-catch ***
+                              currentBatchForChunk.put(entry.key, entry.value);
+                              socket._syncProcessedCounter++; // Increment counters only if put succeeds
+                              socket._syncTotalWrittenCounter++;
+
+                          } catch (putErr) {
+                              // Specifically check if the error is due to the batch being closed
+                              if (putErr.message.includes('Batch is not open')) {
+                                  this.log('SYNC_CHUNK_RACE_CONDITION_CAUGHT (Put)', { peerId, error: `Batch closed concurrently before put for key ${entry.key}. Stopping chunk.`, message: putErr.message });
+                              } else {
+                                  // Log other unexpected errors during put
+                                  this.log('SYNC_CHUNK_PUT_ERROR', { peerId, error: `Error during put for key ${entry.key}`, message: putErr.message });
+                              }
+                              processingErrorOccurred = true; // Stop processing the rest of the chunk
+                              break; // Exit the loop
+                          }
+
+                          // --- Check for Intermediate Write (Only if put succeeded) ---
+                          if (socket._syncProcessedCounter >= BATCH_WRITE_THRESHOLD) {
+                              this.log('SYNC_CHUNK_THRESHOLD_REACHED (Post-Put)', { peerId, batchSize: currentBatchForChunk.length, entryKey: entry.key });
+                              try {
+                                  // ... (intermediate write logic remains the same) ...
+                                  this.log('SYNC_CHUNK_WRITING_BATCH (Intermediate)', { peerId, batchSize: currentBatchForChunk.length });
+                                  await currentBatchForChunk.write();
+                                  this.log('SYNC_CHUNK_BATCH_WRITE_SUCCESS (Intermediate)', { peerId, batchSize: currentBatchForChunk.length });
+
+                                  if (socket._syncBatch === currentBatchForChunk) {
+                                      socket._syncBatch = this.db.db.batch();
+                                      socket._syncProcessedCounter = 0;
+                                      currentBatchForChunk = socket._syncBatch;
+                                      this.log('SYNC_CHUNK_NEW_BATCH_CREATED (Intermediate)', { peerId });
+                                  } else {
+                                      this.log('SYNC_CHUNK_WARNING_BATCHING', { peerId, message: 'Sync ended or batch replaced during intermediate write completion, cannot create new batch.' });
+                                      processingErrorOccurred = true;
+                                      break;
+                                  }
+                              } catch (writeErr) {
+                                  this.log('SYNC_CHUNK_BATCH_WRITE_ERROR (Intermediate)', { peerId, error: writeErr.message, stack: writeErr.stack });
+                                  socket._syncBatch = null;
+                                  processingErrorOccurred = true;
+                                  break;
+                              }
+                          } // End threshold check
+                      } // End merge logic check
+                  } catch (outerErr) {
+                      // Catch errors during the get() or the outer checks
+                       this.log('SYNC_CHUNK_ENTRY_PROCESSING_ERROR (Outer)', { peerId, error: `Error processing chunk entry for key ${entry.key}`, message: outerErr.message });
+                       processingErrorOccurred = true; // Signal to stop loop on any error
+                       break; // Stop processing the rest of the chunk on error
+                  }
+                  // --- End Process Entry ---
+
+              } // End of for loop over chunk entries
+
+              // After the loop, if an intermediate write happened within this chunk,
+              // currentBatchForChunk might now refer to the *new* batch started mid-chunk.
+              // The final batch write (if needed) will happen in the sync_end handler.
+
+              // If an error occurred, ensure the main batch ref is potentially cleared.
+              if (processingErrorOccurred && socket._syncBatch) {
+                   // Optional: Decide if we should clear the main batch ref on processing errors
+                   // socket._syncBatch = null;
+                   this.log('SYNC_CHUNK_PROCESSING_ERROR_FLAG_SET', { peerId });
+              }
+
+          } // End messageType === 'sync_chunk'
+
 
           if (messageType === 'sync_end') {
-              if (!socket._chunkBuffer) {
-                   this.log('SYNC_CHUNK_ERROR', { peerId, error: 'Received sync_end before sync_start or after error' });
+              let finalBatch = socket._syncBatch; // Get ref to the batch active when sync_end arrives
+
+              if (!finalBatch) {
+                   this.log('SYNC_CHUNK_ERROR_BATCHING', { peerId, error: 'Received sync_end but no batch active (already ended or errored)' });
+                   // Clean up any potentially lingering state just in case
+                   socket._syncProcessedCounter = null;
+                   socket._syncTotalWrittenCounter = null;
+                   socket._syncInitialLocalVersion = null;
+                   socket._syncInitialLocalLastModified = null;
+                   socket._syncRemoteMeta = null;
                    return;
               }
-              if (socket._chunkBuffer.length !== parsed.totalEntries) {
-                   this.log('SYNC_CHUNK_ERROR', {
-                       peerId,
-                       error: 'Received sync_end with mismatched entry count',
-                       expected: parsed.totalEntries,
-                       received: socket._chunkBuffer.length
-                   });
-                   socket._chunkBuffer = null; // Clear buffer on error
-                   socket._syncMeta = null;
-                   return; // Don't merge incomplete data
-              }
 
-              this.log('SYNC_CHUNK_END', { peerId, totalEntries: socket._chunkBuffer.length });
+              this.log('SYNC_CHUNK_END_BATCHING', { peerId, finalBatchSize: finalBatch.length, totalEntriesExpected: parsed.totalEntries });
 
-              // Assemble the full state from chunks
-              const assembledEntries = {};
-              for (const entry of socket._chunkBuffer) {
-                  // Ensure entry has key and value before assigning
-                  if (entry && entry.key !== undefined && entry.value !== undefined) {
-                      assembledEntries[entry.key] = entry.value;
+              let changesMade = false; // Track if any DB write occurs
+
+              try {
+                  // Write the final batch if it contains operations
+                  if (finalBatch.length > 0) {
+                      this.log('SYNC_CHUNK_WRITING_FINAL_BATCH', { peerId, batchSize: finalBatch.length });
+                      await finalBatch.write(); // Write the specific final batch instance
+                      this.log('SYNC_CHUNK_FINAL_BATCH_WRITE_SUCCESS', { peerId, batchSize: finalBatch.length });
+                      changesMade = true; // Mark changes made if final batch was written
                   } else {
-                      this.log('SYNC_CHUNK_WARNING', { peerId, message: 'Skipping invalid entry in chunk buffer', entry: entry });
+                       this.log('SYNC_CHUNK_FINAL_BATCH_EMPTY', { peerId });
                   }
+
+                  // Verify total entry count (use the counter of entries added to batches)
+                  if (socket._syncTotalWrittenCounter !== parsed.totalEntries) {
+                      this.log('SYNC_CHUNK_ERROR_BATCHING', {
+                          peerId,
+                          error: 'sync_end totalEntries mismatch',
+                          expected: parsed.totalEntries,
+                          written: socket._syncTotalWrittenCounter // Log the count we tracked
+                      });
+                      // Potentially revert changes or log inconsistency? For now, just log.
+                  } else {
+                      this.log('SYNC_CHUNK_ENTRY_COUNT_MATCH', { peerId, count: socket._syncTotalWrittenCounter });
+                  }
+
+                  // --- Update Local Metadata ---
+                  const remoteVersion = parsed.version !== undefined ? parsed.version : socket._syncRemoteMeta?.version;
+                  const remoteLastModified = parsed.lastModified !== undefined ? parsed.lastModified : socket._syncRemoteMeta?.lastModified;
+                  const initialLocalVersion = socket._syncInitialLocalVersion;
+                  const initialLocalLastModified = socket._syncInitialLocalLastModified;
+                  const remoteStateWasNewer = (remoteVersion > initialLocalVersion || remoteLastModified > initialLocalLastModified);
+                  // Base decision on whether the final batch was written OR if remote state was newer (even if no entries changed locally)
+                  if (changesMade || remoteStateWasNewer) {
+                     const metadataBatch = this.db.db.batch();
+                     const entriesWereWritten = socket._syncTotalWrittenCounter > 0;
+                     const newVersion = Math.max(initialLocalVersion, remoteVersion || 0) + (entriesWereWritten ? 1 : 0);
+                     const newLastModified = Date.now();
+                     metadataBatch.put(this.db.METADATA_VERSION_KEY, newVersion);
+                     metadataBatch.put(this.db.METADATA_LAST_MODIFIED_KEY, newLastModified);
+                     await metadataBatch.write();
+                     // Update in-memory state
+                     this.db.version = newVersion;
+                     this.db.lastModified = newLastModified;
+                     changesMade = true; // Ensure flag is set if metadata updated
+                     this.log('SYNC_CHUNK_METADATA_UPDATED', { peerId, newVersion, newLastModified: new Date(newLastModified).toISOString() });
+                  } else {
+                       this.log('SYNC_CHUNK_METADATA_NO_UPDATE', { peerId, reason: 'Remote state not newer and no entries written' });
+                  }
+
+                  // --- Notify Peers ---
+                  if (changesMade) { // Check if final batch OR metadata was written
+                      console.log(`Batch sync completed from ${peerId}. ${socket._syncTotalWrittenCounter} potential changes processed. New version: ${this.db.version}`);
+                      this.stats.changesMerged += socket._syncTotalWrittenCounter; // Rough estimate, actual merge count might differ slightly
+                      this.stats.lastChangeAt = new Date().toISOString();
+
+                      // Notify other peers (Send metadata only)
+                      const otherPeers = Array.from(this.connections)
+                          .filter(s => s !== socket && s && !s.destroyed && s._peerNodeId); // Ensure peer has ID
+                      let peersToNotify = otherPeers;
+                      if (otherPeers.length > 3) {
+                          peersToNotify = otherPeers.sort(() => Math.random() - 0.5).slice(0, 3);
+                      }
+
+                      this.log('NOTIFY_PEERS_AFTER_BATCH_SYNC', {
+                          sourcePeerId: peerId,
+                          peerCount: peersToNotify.length,
+                          totalPeers: otherPeers.length,
+                          changesApprox: socket._syncTotalWrittenCounter,
+                          syncChain: socket._syncChain
+                      });
+
+                      for (const otherSocket of peersToNotify) {
+                          // Send metadata only, they will request full state if needed
+                          await this.handleSyncRequest(otherSocket, `changes_from_${peerId}`);
+                      }
+                  } else {
+                       console.log(`Batch sync completed from ${peerId}. No changes applied. Version: ${this.db.version}`);
+                   }
+
+
+              } catch (err) {
+                   this.log('SYNC_CHUNK_FINAL_PROCESSING_ERROR', { peerId, error: err.message, stack: err.stack });
+                   // Handle error during final write or metadata update
+              } finally {
+                  // --- Clean up socket state ---
+                  socket._syncBatch = null; // Always clear the batch reference
+                  socket._syncProcessedCounter = null;
+                  socket._syncTotalWrittenCounter = null;
+                  socket._syncInitialLocalVersion = null;
+                  socket._syncInitialLocalLastModified = null;
+                  socket._syncRemoteMeta = null;
+                  this.log('SYNC_CHUNK_STATE_CLEANED (sync_end)', { peerId });
               }
-              const receivedVersion = parsed.version !== undefined ? parsed.version : (socket._syncMeta ? socket._syncMeta.version : 0);
-              const receivedLastModified = parsed.lastModified !== undefined ? parsed.lastModified : (socket._syncMeta ? socket._syncMeta.lastModified : 0);
-
-              socket._chunkBuffer = null; // Clear buffer
-              socket._syncMeta = null;    // Clear sync metadata
-
-              // Prepare remoteDbState for merge
-              const remoteDbState = {
-                  entries: assembledEntries,
-                  version: receivedVersion,
-                  lastModified: receivedLastModified,
-                  nodeId: peerId
-              };
-
-              // Proceed to merge
-              await this.mergeReceivedState(remoteDbState, socket, parsed.syncChain);
-              return; // Merge complete
+              return; // Sync complete
           }
           // --- End Chunk Handling ---
 
 
-          // --- Merge Logic (Only for non-chunked full_state messages, if any remain) ---
-          // This path should ideally not be hit if chunking works correctly
+          // --- Merge Logic (Only for non-chunked full_state messages, legacy handling) ---
+          // This path should ideally not be hit often if chunking works correctly
           if (messageType === 'full_state' && parsed.entries) {
               this.log('MERGE_START_FULL_LEGACY', { peerId, entryCount: Object.keys(parsed.entries).length });
+              // !!! WARNING: This legacy path still loads the full state into memory via parsed.entries !!!
+              // It calls the old mergeReceivedState which needs the full state.
+              // Consider removing this path entirely or adapting mergeReceivedState if legacy support is critical.
               const remoteDbState = {
                   entries: parsed.entries || {},
                   version: parsed.version,
                   lastModified: parsed.lastModified,
                   nodeId: peerId
               };
-              await this.mergeReceivedState(remoteDbState, socket, parsed.syncChain);
+              // Make sure mergeReceivedState exists if this path is kept
+              if (typeof this.mergeReceivedState === 'function') {
+                  await this.mergeReceivedState(remoteDbState, socket, parsed.syncChain);
+              } else {
+                  this.log('MERGE_ERROR_LEGACY', { peerId, error: 'mergeReceivedState function not found. Cannot process legacy full_state message.'});
+              }
           }
           // --- End Merge Logic ---
 
       } catch (err) {
+         // Make sure peerId is defined for logging, fallback if necessary
+         const errorPeerId = socket?._peerNodeId || currentPeerId || 'unknown';
          this.log('PEER_DATA_ERROR', {
-              peerId: socket._peerNodeId || 'unknown', // Use socket's ID on error
+              peerId: errorPeerId,
               error: err.message,
               stack: err.stack,
               rawDataSample: data.toString('utf8').substring(0, 200)
           });
           this.stats.errors++;
-          if (this.db) delete this.db.log;
-          // Clear potentially corrupted chunk buffer on error
+          // Clean up potentially corrupted sync state on the socket on any error
           if (socket) {
-              socket._chunkBuffer = null;
-              socket._syncMeta = null;
+              socket._syncBatch = null;
+              socket._syncProcessedCounter = null;
+              socket._syncTotalWrittenCounter = null;
+              socket._syncInitialLocalVersion = null;
+              socket._syncInitialLocalLastModified = null;
+              socket._syncRemoteMeta = null;
           }
+          // Remove logger if it was attached to db instance
+          if (this.db && this.db.log) delete this.db.log;
       }
   }
 
@@ -991,76 +1219,12 @@ class P2PDBClient {
       }
   }
 
-  // *** NEW: Helper function to merge received state (called after reassembly or for direct full state) ***
+  // *** REMOVED: mergeReceivedState function is no longer needed for chunked sync ***
+  /*
   async mergeReceivedState(remoteDbState, socket, syncChain) {
-      const peerId = remoteDbState.nodeId;
-      try {
-          // Ensure remoteDbState and entries are valid before proceeding
-          if (!remoteDbState || typeof remoteDbState.entries !== 'object' || remoteDbState.entries === null) {
-              this.log('MERGE_ABORTED', { peerId, reason: 'Invalid remote state or entries object' });
-              return;
-          }
-
-          this.db.log = this.log.bind(this);
-          let changes = 0;
-
-          // Log before merge attempt
-          this.log('MERGE_ATTEMPT', {
-              peerId,
-              remoteVersion: remoteDbState.version,
-              remoteLastModified: remoteDbState.lastModified,
-              remoteEntryCount: Object.keys(remoteDbState.entries).length,
-              localVersion: this.db.version,
-              localLastModified: this.db.lastModified
-          });
-
-
-          changes = await this.db.merge(remoteDbState);
-
-          // Log after merge attempt
-          this.log('MERGE_RESULT', {
-              peerId,
-              changes,
-              newLocalVersion: this.db.version,
-              newLocalLastModified: this.db.lastModified, // Log the updated local timestamp
-              syncChain: syncChain
-          });
-
-
-          delete this.db.log; // Remove logger override
-
-          if (changes > 0) {
-              console.log(`Merged ${changes} changes from ${peerId}. New version: ${this.db.version}`);
-              this.stats.changesMerged += changes;
-              this.stats.lastChangeAt = new Date().toISOString();
-
-              // Notify peers logic (Send metadata only)
-              const otherPeers = Array.from(this.connections)
-                  .filter(s => s !== socket && s && !s.destroyed); // Added check for s existence
-              let peersToNotify = otherPeers;
-              if (otherPeers.length > 3) {
-                  peersToNotify = otherPeers.sort(() => Math.random() - 0.5).slice(0, 3);
-              }
-
-              this.log('NOTIFY_PEERS', {
-                  sourcePeerId: peerId,
-                  peerCount: peersToNotify.length,
-                  totalPeers: otherPeers.length,
-                  changes,
-                  syncChain: syncChain
-              });
-
-              for (const otherSocket of peersToNotify) {
-                  // Send metadata only, they will request full state if needed
-                  await this.handleSyncRequest(otherSocket, `changes_from_${peerId}`);
-              }
-          }
-      } catch (err) {
-          this.log('MERGE_ERROR', { peerId, error: err.message, stack: err.stack });
-          this.stats.errors++;
-          if (this.db) delete this.db.log; // Ensure logger override is removed on error
-      }
+      // ... Old implementation ...
   }
+  */
 
 
   // Start the P2P network
