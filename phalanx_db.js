@@ -1004,9 +1004,9 @@ class P2PDBClient {
                   // Verify total entry count (use the counter of entries added to batches)
                   if (socket._syncTotalWrittenCounter !== parsed.totalEntries) {
                       this.log('SYNC_CHUNK_ERROR_BATCHING', {
-                          peerId,
+                       peerId,
                           error: 'sync_end totalEntries mismatch',
-                          expected: parsed.totalEntries,
+                       expected: parsed.totalEntries,
                           written: socket._syncTotalWrittenCounter // Log the count we tracked
                       });
                       // Potentially revert changes or log inconsistency? For now, just log.
@@ -1087,27 +1087,150 @@ class P2PDBClient {
           // --- End Chunk Handling ---
 
 
-          // --- Merge Logic (Only for non-chunked full_state messages, legacy handling) ---
-          // This path should ideally not be hit often if chunking works correctly
+          // --- Merge Logic for LEGACY non-chunked full_state messages ---
           if (messageType === 'full_state' && parsed.entries) {
-              this.log('MERGE_START_FULL_LEGACY', { peerId, entryCount: Object.keys(parsed.entries).length });
-              // !!! WARNING: This legacy path still loads the full state into memory via parsed.entries !!!
-              // It calls the old mergeReceivedState which needs the full state.
-              // Consider removing this path entirely or adapting mergeReceivedState if legacy support is critical.
-              const remoteDbState = {
-                  entries: parsed.entries || {},
-                  version: parsed.version,
-                  lastModified: parsed.lastModified,
-                  nodeId: peerId
-              };
-              // Make sure mergeReceivedState exists if this path is kept
-              if (typeof this.mergeReceivedState === 'function') {
-                  await this.mergeReceivedState(remoteDbState, socket, parsed.syncChain);
-              } else {
-                  this.log('MERGE_ERROR_LEGACY', { peerId, error: 'mergeReceivedState function not found. Cannot process legacy full_state message.'});
+              this.log('PEER_DATA_INFO', {
+                  peerId,
+                  message: 'Processing legacy full_state message with batching.',
+                  remoteVersion: parsed.version,
+                  remoteLastModified: parsed.lastModified,
+                  entryCountHint: Object.keys(parsed.entries).length
+              });
+
+              // *** Process parsed.entries using batching ***
+              const BATCH_WRITE_THRESHOLD_LEGACY = 1000;
+              let legacyBatch = this.db.db.batch();
+              let legacyProcessedCounter = 0;
+              let legacyTotalWrittenCounter = 0;
+              let legacyProcessingError = false;
+              const initialLocalVersion = this.db.version; // Store local state before merge
+              const initialLocalLastModified = this.db.lastModified;
+
+              try {
+                  const remoteEntries = parsed.entries || {}; // Safety check
+                  for (const key in remoteEntries) {
+                      // Basic check for own properties, skip internal keys
+                      if (!remoteEntries.hasOwnProperty(key) ||
+                          key === this.db.METADATA_VERSION_KEY || key === this.db.METADATA_LAST_MODIFIED_KEY || key === '__test__') {
+                          continue;
+                      }
+
+                      const remoteEntry = remoteEntries[key];
+                      if (!remoteEntry || typeof remoteEntry.timestamp === 'undefined') {
+                          this.log('SYNC_LEGACY_WARNING', { peerId, message: 'Skipping invalid entry in legacy payload', entryKey: key });
+                          continue;
+                      }
+
+                      try {
+                          const localEntry = await this.db.db.get(key).catch(() => null);
+
+                          // Merge logic: remote is newer if no local entry OR remote timestamp is later
+                          if (!localEntry || new Date(localEntry.timestamp) < new Date(remoteEntry.timestamp)) {
+                              legacyBatch.put(key, remoteEntry);
+                              legacyProcessedCounter++;
+                              legacyTotalWrittenCounter++;
+                          }
+                      } catch (getErr) {
+                           this.log('SYNC_LEGACY_ERROR', { peerId, error: `Error getting local key ${key} during legacy merge`, message: getErr.message });
+                           legacyProcessingError = true;
+                           break; // Stop processing on error
+                      }
+
+                      // Write batch if threshold reached
+                      if (legacyProcessedCounter >= BATCH_WRITE_THRESHOLD_LEGACY) {
+                          try {
+                              this.log('SYNC_LEGACY_WRITING_BATCH', { peerId, batchSize: legacyBatch.length });
+                              await legacyBatch.write();
+                              legacyBatch = this.db.db.batch(); // Start new batch
+                              legacyProcessedCounter = 0;      // Reset counter
+                          } catch (writeErr) {
+                              this.log('SYNC_LEGACY_BATCH_WRITE_ERROR', { peerId, error: writeErr.message, stack: writeErr.stack });
+                              legacyProcessingError = true;
+                              break; // Stop processing on write error
+                          }
+                      }
+                  } // End for loop over entries
+
+                  // Write the final batch if no errors occurred and batch has data
+                  if (!legacyProcessingError && legacyBatch.length > 0) {
+                      try {
+                          this.log('SYNC_LEGACY_WRITING_FINAL_BATCH', { peerId, batchSize: legacyBatch.length });
+                          await legacyBatch.write();
+                      } catch (finalWriteErr) {
+                          this.log('SYNC_LEGACY_FINAL_BATCH_WRITE_ERROR', { peerId, error: finalWriteErr.message, stack: finalWriteErr.stack });
+                          legacyProcessingError = true;
+                      }
+                  }
+
+                  // --- Update Metadata and Notify (if processing succeeded) ---
+                  if (!legacyProcessingError) {
+                      const remoteVersion = parsed.version;
+                      const remoteLastModified = parsed.lastModified;
+                      const remoteStateWasNewer = (remoteVersion > initialLocalVersion || remoteLastModified > initialLocalLastModified);
+                      const entriesWereWritten = legacyTotalWrittenCounter > 0;
+                      let changesMade = entriesWereWritten; // Track if entries or metadata changed
+
+                      if (entriesWereWritten || remoteStateWasNewer) {
+                           const metadataBatch = this.db.db.batch();
+                           const newVersion = Math.max(initialLocalVersion, remoteVersion || 0) + (entriesWereWritten ? 1 : 0);
+                           const newLastModified = Date.now();
+
+                           metadataBatch.put(this.db.METADATA_VERSION_KEY, newVersion);
+                           metadataBatch.put(this.db.METADATA_LAST_MODIFIED_KEY, newLastModified);
+
+                           this.log('SYNC_LEGACY_UPDATING_METADATA', {
+                               peerId, reason: `remoteNewer=${remoteStateWasNewer}, entriesWritten=${entriesWereWritten}`,
+                               oldVersion: this.db.version, newVersion,
+                               oldLastMod: this.db.lastModified, newLastMod: newLastModified
+                           });
+                           try {
+                               await metadataBatch.write();
+                               this.db.version = newVersion;
+                               this.db.lastModified = newLastModified;
+                               changesMade = true; // Mark changes if metadata was written
+                               this.log('SYNC_LEGACY_METADATA_UPDATED', { peerId, newVersion, newLastModified: new Date(newLastModified).toISOString() });
+                           } catch(metaErr) {
+                               this.log('SYNC_LEGACY_METADATA_WRITE_ERROR', { peerId, error: metaErr.message });
+                               // Continue without metadata update? Or flag as error?
+                           }
+                      } else {
+                            this.log('SYNC_LEGACY_METADATA_NO_UPDATE', { peerId, reason: 'Remote state not newer and no entries written' });
+                      }
+
+                      // Notify peers if changes were made
+                      if (changesMade) {
+                           console.log(`Legacy sync completed from ${peerId}. ${legacyTotalWrittenCounter} potential changes processed. New version: ${this.db.version}`);
+                           this.stats.changesMerged += legacyTotalWrittenCounter; // Approx.
+                           this.stats.lastChangeAt = new Date().toISOString();
+                           // Notify other peers (Send metadata only)
+                           const otherPeers = Array.from(this.connections).filter(s => s !== socket && s && !s.destroyed && s._peerNodeId);
+                           let peersToNotify = otherPeers;
+                           if (otherPeers.length > 3) {
+                               peersToNotify = otherPeers.sort(() => Math.random() - 0.5).slice(0, 3);
+                           }
+                           this.log('NOTIFY_PEERS_AFTER_LEGACY_SYNC', {
+                               sourcePeerId: peerId, peerCount: peersToNotify.length,
+                               totalPeers: otherPeers.length, changesApprox: legacyTotalWrittenCounter,
+                               syncChain: parsed.syncChain
+                           });
+                           for (const otherSocket of peersToNotify) {
+                               await this.handleSyncRequest(otherSocket, `changes_from_legacy_${peerId}`);
+                           }
+                       } else {
+                            console.log(`Legacy sync completed from ${peerId}. No changes applied. Version: ${this.db.version}`);
+                       }
+                  } else {
+                       console.error(`Legacy sync processing aborted due to error from peer ${peerId}.`);
+                  }
+
+      } catch (err) {
+                   this.log('SYNC_LEGACY_UNEXPECTED_ERROR', { peerId, error: err.message, stack: err.stack });
+              } finally {
+                  // Clean up - ensure batch reference is cleared if loop errored early
+                  legacyBatch = null;
               }
           }
-          // --- End Merge Logic ---
+          // --- End Legacy Merge Logic ---
 
       } catch (err) {
          // Make sure peerId is defined for logging, fallback if necessary
