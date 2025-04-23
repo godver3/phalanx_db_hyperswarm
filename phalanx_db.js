@@ -624,24 +624,54 @@ class P2PDBClient {
   }
   
   // Function to save database snapshot to disk
-  // NOTE: This function still loads the entire database into memory via toJSON()
-  // Call it judiciously (e.g., on shutdown or for manual backups).
+  // WARNING: HIGH MEMORY USAGE! This function loads the *entire* database
+  // into memory via this.db.toJSON() before saving. Avoid calling it
+  // frequently or on systems with tight memory constraints.
+  // Consider streaming backups for very large databases.
   async saveDatabase() {
     try {
+      console.warn('[saveDatabase] Warning: Loading entire database into memory for snapshot...');
       const dbJson = await this.db.toJSON(); // This loads all entries into memory!
       const data = JSON.stringify(dbJson, null, 2);
-      fs.writeFileSync(this.getSaveFilePath(), data);
-      console.log('Saved database snapshot to disk:', this.getSaveFilePath());
+      const filePath = this.getSaveFilePath();
+      fs.writeFileSync(filePath, data);
+      console.log('Saved database snapshot to disk:', filePath);
     } catch (err) {
         console.error('Error saving database snapshot:', err);
     }
   }
   
   // Function to list all entries
+  // WARNING: This function iterates and logs all non-metadata entries.
+  // Avoid using in production if value sizes are large or entry count is massive.
   async listAllEntries() {
-    const entries = await this.db._getAllEntries();
-    console.log('Last modified:', new Date(this.db.lastModified).toISOString());
-    return entries;
+    console.log(`Listing all entries (Version: ${this.db.version}, Last Modified: ${new Date(this.db.lastModified).toISOString()})...`);
+    let count = 0;
+    const iterator = this.db.db.iterator();
+    try {
+        for await (const [key, value] of iterator) {
+            // Skip internal metadata keys and test key
+            if (key !== '__test__' && key !== this.db.METADATA_VERSION_KEY && key !== this.db.METADATA_LAST_MODIFIED_KEY) {
+                // Optional: Log only active entries
+                // if (value && !value.deleted) {
+                //     console.log(`${key}:`, value);
+                //     count++;
+                // }
+                // Or log all non-metadata entries:
+                console.log(`${key}:`, value);
+                count++;
+            }
+        }
+        console.log(`Finished listing ${count} non-metadata entries.`);
+    } catch (err) {
+        console.error('Error iterating through entries for listing:', err);
+    } finally {
+        await iterator.close().catch(err => console.error('Error closing list iterator:', err));
+    }
+    // Original implementation (loads all to memory):
+    // const entries = await this.db._getAllEntries();
+    // console.log('Last modified:', new Date(this.db.lastModified).toISOString());
+    // return entries;
   }
   
   // Function to handle sync with a new peer (Sends Metadata Only Initially)
@@ -796,7 +826,8 @@ class P2PDBClient {
 
           // Check only if we received metadata OR an empty full_state message
           if ((messageType === 'metadata_only' || (messageType === 'full_state' && !parsed.entries)) &&
-              (remoteVersion > localVersion || remoteLastModified > localLastModified)) {
+              // *** Use Date.parse() for comparison ***
+              (remoteVersion > localVersion || (remoteLastModified && localLastModified && Date.parse(remoteLastModified) > Date.parse(localLastModified)))) {
 
               // Check cooldown before requesting again from this specific peer
               const now = Date.now();
@@ -902,7 +933,8 @@ class P2PDBClient {
                       // --- END PRIMARY CHECKS ---
 
                       // Merge logic: remote is newer if no local entry OR remote timestamp is later
-                      if (!localEntry || new Date(localEntry.timestamp) < new Date(entry.value.timestamp)) {
+                      // *** Use Date.parse() for comparison ***
+                      if (!localEntry || (localEntry.timestamp && entry.value.timestamp && Date.parse(localEntry.timestamp) < Date.parse(entry.value.timestamp))) {
                           try {
                               // *** Add put operation inside its own try-catch ***
                               currentBatchForChunk.put(entry.key, entry.value);
@@ -1019,7 +1051,8 @@ class P2PDBClient {
                   const remoteLastModified = parsed.lastModified !== undefined ? parsed.lastModified : socket._syncRemoteMeta?.lastModified;
                   const initialLocalVersion = socket._syncInitialLocalVersion;
                   const initialLocalLastModified = socket._syncInitialLocalLastModified;
-                  const remoteStateWasNewer = (remoteVersion > initialLocalVersion || remoteLastModified > initialLocalLastModified);
+                  // *** Use Date.parse() for comparison ***
+                  const remoteStateWasNewer = (remoteVersion > initialLocalVersion || (remoteLastModified && initialLocalLastModified && Date.parse(remoteLastModified) > Date.parse(initialLocalLastModified)));
                   // Base decision on whether the final batch was written OR if remote state was newer (even if no entries changed locally)
                   if (changesMade || remoteStateWasNewer) {
                      const metadataBatch = this.db.db.batch();
@@ -1125,7 +1158,8 @@ class P2PDBClient {
                           const localEntry = await this.db.db.get(key).catch(() => null);
 
                           // Merge logic: remote is newer if no local entry OR remote timestamp is later
-                          if (!localEntry || new Date(localEntry.timestamp) < new Date(remoteEntry.timestamp)) {
+                          // *** Use Date.parse() for comparison ***
+                          if (!localEntry || (localEntry.timestamp && remoteEntry.timestamp && Date.parse(localEntry.timestamp) < Date.parse(remoteEntry.timestamp))) {
                               legacyBatch.put(key, remoteEntry);
                               legacyProcessedCounter++;
                               legacyTotalWrittenCounter++;
@@ -1166,7 +1200,8 @@ class P2PDBClient {
                   if (!legacyProcessingError) {
                       const remoteVersion = parsed.version;
                       const remoteLastModified = parsed.lastModified;
-                      const remoteStateWasNewer = (remoteVersion > initialLocalVersion || remoteLastModified > initialLocalLastModified);
+                      // *** Use Date.parse() for comparison ***
+                      const remoteStateWasNewer = (remoteVersion > initialLocalVersion || (remoteLastModified && initialLocalLastModified && Date.parse(remoteLastModified) > Date.parse(initialLocalLastModified)));
                       const entriesWereWritten = legacyTotalWrittenCounter > 0;
                       let changesMade = entriesWereWritten; // Track if entries or metadata changed
 
@@ -1262,7 +1297,7 @@ class P2PDBClient {
       this.log('SENDING_FULL_STATE_CHUNKS', { peerId, trigger });
 
       try {
-          const chunkSize = 1000; // Configurable chunk size
+          const chunkSize = 250; // << REDUCED CHUNK SIZE
           let currentChunk = [];
           let sequence = 0;
           let totalEntries = 0;
@@ -1686,15 +1721,17 @@ class P2PDBClient {
   
   // Get all entries
   async getAllEntries() {
-    const entries = await this.db._getAllEntries();
+    // WARNING: This function loads all non-deleted entries into memory.
+    // Prefer using iterators or getAllEntriesStructured for large datasets.
+    const entries = await this.db._getAllEntries(); // Still loads all initially
     const activeEntries = {};
-    
+
     for (const [key, entry] of Object.entries(entries)) {
       if (!entry.deleted) {
         activeEntries[key] = entry;
       }
     }
-    
+
     return activeEntries;
   }
   
@@ -1713,12 +1750,83 @@ class P2PDBClient {
     return null;
   }
 
-  // Function to get all entries in the structured format
-  async getAllEntriesStructured() {
-    const entries = await this.getAllEntries();
-    return this.transformToStructuredFormat(entries);
+  // Function to get all entries in the structured format using an iterator
+  // Supports pagination via limit and startKey.
+  async getAllEntriesStructured(options = {}) {
+      const { limit = Infinity, startKey = undefined } = options;
+      const data = [];
+      const infohashMap = new Map();
+      let entriesProcessed = 0;
+
+      // Iterator options: start seeking from startKey if provided
+      const iteratorOptions = {};
+      if (startKey) {
+          iteratorOptions.gt = startKey; // 'gt' ensures we don't include the startKey itself
+      }
+
+      const iterator = this.db.db.iterator(iteratorOptions);
+
+      try {
+          for await (const [key, entry] of iterator) {
+              // Stop if limit is reached
+              if (entriesProcessed >= limit) {
+                  break;
+              }
+
+              // Skip internal metadata keys, test key, and deleted entries
+              if (key === '__test__' || key === this.db.METADATA_VERSION_KEY || key === this.db.METADATA_LAST_MODIFIED_KEY || entry.deleted) {
+                  continue;
+              }
+
+              // Parse the infohash+service key
+              const parts = key.split('+');
+              if (parts.length < 2) continue; // Skip malformed keys
+              const infohash = parts[0];
+              const service = parts.slice(1).join('+'); // Handle services with '+' in their name
+
+              // Get or create the infohash entry in the result structure
+              let infohashEntry = infohashMap.get(infohash);
+              if (!infohashEntry) {
+                  infohashEntry = {
+                      infohash,
+                      services: {}
+                  };
+                  data.push(infohashEntry);
+                  infohashMap.set(infohash, infohashEntry);
+              }
+
+              // Convert any string status to boolean if needed
+              let cached = entry.cacheStatus;
+              if (typeof cached === 'string') {
+                  cached = cached === 'completed' || cached === 'cached';
+              }
+
+              // Add the service data
+              infohashEntry.services[service] = {
+                  cached: cached,
+                  last_modified: entry.timestamp,
+                  expiry: entry.expiration
+              };
+
+              entriesProcessed++; // Count entries added to the result structure
+          }
+      } catch (err) {
+          console.error('Error iterating through entries for structured format:', err);
+          this.log('STRUCTURED_FORMAT_ERROR', { error: err.message, stack: err.stack });
+          // Depending on requirements, might want to return partial data or throw
+      } finally {
+          await iterator.close().catch(err => console.error('Error closing structured format iterator:', err));
+      }
+
+      // Clear the map to free memory before returning
+      infohashMap.clear();
+
+      // Return the data page
+      // Note: The *caller* (e.g., REST API) needs to handle getting the 'nextKey'
+      // for subsequent pages if needed, potentially by taking the last key from this page.
+      return { data };
   }
-  
+
   // Function to transform entries from internal format to structured format
   transformToStructuredFormat(entries) {
     const data = [];
