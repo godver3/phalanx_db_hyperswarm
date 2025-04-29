@@ -693,7 +693,7 @@ class P2PDBClient {
     // Optimization 1: Sync cooldown - prevent excessive syncs with the same peer
     this.lastSyncTimes = new Map(); // Track last sync time per peer
     // *** MODIFIED: Increase syncCooldown ***
-    this.syncCooldown = 6000; // 60 seconds minimum between syncs with the same peer
+    this.syncCooldown = 30000; // 30 seconds minimum between sending metadata syncs to the same peer
     // *** END MODIFICATION ***
     
     // Optimization 2: Version based sync - only sync if DB version changed
@@ -1242,26 +1242,44 @@ class P2PDBClient {
                      const newVersion = Math.max(initialLocalVersion, remoteVersion || 0) + (shouldIncrementVersion ? 1 : 0);
                      const newLastModified = Date.now();
 
-                     // *** Use incremental count update ***
-                     const newActiveCount = initialLocalCount + finalNetCountChange;
-                     this.log('SYNC_CHUNK_UPDATING_COUNT', { connectionId: socket._connectionId || 'N/A', peerId, initialCount: initialLocalCount, netChange: finalNetCountChange, newCount: newActiveCount });
+                     // *** FIX: Calculate new count based on CURRENT count, not initial count of this sync ***
+                     // const newActiveCount = initialLocalCount + finalNetCountChange; // OLD - Incorrect
+                     const currentCountBeforeUpdate = this.db.activeEntriesCount; // Get the current count
+                     const newActiveCount = currentCountBeforeUpdate + finalNetCountChange; // Calculate based on current
+                     this.log('SYNC_CHUNK_UPDATING_COUNT', {
+                         connectionId: socket._connectionId || 'N/A',
+                         peerId,
+                         initialCountForThisSync: initialLocalCount, // Log the initial count for context
+                         currentCountBeforeUpdate: currentCountBeforeUpdate, // Log the count we are adding to
+                         netChange: finalNetCountChange,
+                         newCalculatedCount: newActiveCount
+                     });
+                     // *** END FIX ***
                      // *** REMOVED: _calculateActiveEntries() call ***
 
                      metadataBatch.put(this.db.METADATA_VERSION_KEY, newVersion);
                      metadataBatch.put(this.db.METADATA_LAST_MODIFIED_KEY, newLastModified);
                      metadataBatch.put(this.db.METADATA_ACTIVE_COUNT_KEY, newActiveCount); // Write the new count
 
-                     this.log('SYNC_CHUNK_WRITING_METADATA', { /* ... include newCount ... */ });
+                     this.log('SYNC_CHUNK_WRITING_METADATA', { /* ... include newCount ... */ connectionId: socket._connectionId || 'N/A', peerId, localVersion: this.db.version, remoteVersion, newVersion, newLastModified: new Date(newLastModified).toISOString(), newCount: newActiveCount }); // Added more logging context
                      await metadataBatch.write();
 
                      // Update in-memory state
                      this.db.version = newVersion;
                      this.db.lastModified = newLastModified;
-                     this.db.activeEntriesCount = newActiveCount; // *** Update memory count ***
+                     this.db.activeEntriesCount = newActiveCount; // *** Update memory count with the correctly calculated value ***
 
-                     this.log('SYNC_CHUNK_METADATA_UPDATED', { /* ... include newActiveCount ... */});
+                     this.log('SYNC_CHUNK_METADATA_UPDATED', { /* ... include newActiveCount ... */ connectionId: socket._connectionId || 'N/A', peerId, newVersion: this.db.version, newLastModified: new Date(this.db.lastModified).toISOString(), newActiveCount: this.db.activeEntriesCount }); // Added more logging context
                      changesMade = true;
-                  } else { /* ... log no update ... */ }
+                  } else { /* ... log no update ... */
+                       this.log('SYNC_CHUNK_METADATA_NO_UPDATE', {
+                           connectionId: socket._connectionId || 'N/A',
+                           peerId,
+                           reason: `changesMade=${changesMade}, remoteStateWasNewer=${remoteStateWasNewer}`,
+                           currentVersion: this.db.version,
+                           currentCount: this.db.activeEntriesCount
+                       });
+                  }
 
                   // --- Notify Peers ---
                   if (changesMade) {
