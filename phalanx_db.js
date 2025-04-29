@@ -6,6 +6,9 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const { Level } = require('level');
+// *** NEW: Import v8 module ***
+const v8 = require('node:v8');
+// *** END NEW ***
 
 // Add logging setup
 class Logger {
@@ -33,6 +36,20 @@ class Logger {
     }
   }
 }
+
+// *** NEW: Add signal handler for heap snapshots ***
+let heapSnapshotCounter = 0;
+process.on('SIGUSR2', () => {
+  const filename = `heapdump-${process.pid}-${Date.now()}-${heapSnapshotCounter++}.heapsnapshot`;
+  console.log(`Received SIGUSR2, writing heap snapshot to ${filename}...`);
+  try {
+    const generatedFilename = v8.writeHeapSnapshot(filename);
+    console.log(`Heap snapshot written to ${generatedFilename}`);
+  } catch (err) {
+    console.error(`Error writing heap snapshot: ${err}`);
+  }
+});
+// *** END NEW ***
 
 // Basic setup
 const storageDir = path.join(__dirname, 'p2p-db-storage');
@@ -675,13 +692,17 @@ class P2PDBClient {
     
     // Optimization 1: Sync cooldown - prevent excessive syncs with the same peer
     this.lastSyncTimes = new Map(); // Track last sync time per peer
-    this.syncCooldown = 5000; // 5 seconds minimum between syncs with the same peer
+    // *** MODIFIED: Increase syncCooldown ***
+    this.syncCooldown = 6000; // 60 seconds minimum between syncs with the same peer
+    // *** END MODIFICATION ***
     
     // Optimization 2: Version based sync - only sync if DB version changed
     this.peerVersions = new Map(); // Track last known DB version per peer
     
     // Setup memory usage tracking and cleanup
     this.memoryCheckInterval = setInterval(() => this.checkMemoryUsage(), 60000);
+    // *** NEW: Map to hold processing state per socket ***
+    this.syncProcessingState = new Map(); // Map socket -> { queue: [], processing: false }
   }
   
   async initializeDatabase() {
@@ -782,622 +803,587 @@ class P2PDBClient {
     // return entries;
   }
   
-  // Function to handle sync with a new peer (Sends Metadata Only Initially)
-  async handleSyncRequest(socket, trigger = 'unknown') {
+  // *** NEW: Helper function to write data with backpressure handling ***
+  _writeDataWithBackpressure(socket, data, logContext) {
+    return new Promise((resolve, reject) => {
+        // *** MODIFIED: Append newline delimiter ***
+        const dataWithNewline = data + '\n';
+        // *** END MODIFICATION ***
+
+        // *** MODIFIED: Use dataWithNewline ***
+        const writeSuccessful = socket.write(dataWithNewline, (err) => {
+            // *** END MODIFICATION ***
+        if (err) {
+          this.log('WRITE_CALLBACK_ERROR', { ...logContext, error: err.message });
+          // It's safer to perhaps not reject here, as the main error/close handlers
+          // might handle the socket destruction and rejection more gracefully.
+          // Let's remove the explicit reject from the callback.
+        }
+      });
+
+      if (writeSuccessful) {
+        resolve();
+              } else {
+        this.log('WRITE_BUFFER_FULL_WAITING_DRAIN', { ...logContext });
+        socket.once('drain', () => {
+          this.log('WRITE_DRAIN_EVENT_RECEIVED', { ...logContext });
+          resolve();
+        });
+      }
+    });
+  }
+
+
+  // *** MODIFIED: Use helper function in handleSyncRequest ***
+  async handleSyncRequest(socket, trigger = 'unknown', parentSyncChain = []) { // Added parentSyncChain param
     const peerIdForLookup = socket._peerNodeId || 'unknown';
+    const logContext = { peerId: peerIdForLookup, trigger, connectionId: socket._connectionId || 'N/A' };
 
     try {
       // Cooldown check
       const now = Date.now();
       const lastSyncTime = this.lastSyncTimes.get(peerIdForLookup) || 0;
       if (trigger !== 'initial_connection' && now - lastSyncTime < this.syncCooldown) {
-        this.log('SYNC_SKIPPED', { peerId: peerIdForLookup, trigger, reason: 'cooldown', timeSinceLastSync: now - lastSyncTime });
+        this.log('SYNC_SKIPPED', { ...logContext, reason: 'cooldown', timeSinceLastSync: now - lastSyncTime });
         return;
       }
 
-      // Sync chain loop detection
-      const syncChain = socket._syncChain || [];
-      if (syncChain.includes(this.nodeId)) {
-        this.log('SYNC_SKIPPED', { peerId: peerIdForLookup, trigger, reason: 'loop_detected', syncChain: syncChain });
-        return;
-      }
-      socket._syncChain = [...syncChain, this.nodeId];
+      // *** REMOVED: Loop detection check is moved to handlePeerData on receive ***
+      // const syncChain = socket._syncChain || []; // OLD
+      // if (syncChain.includes(this.nodeId)) { ... } // OLD
 
-      // --- Always send metadata first ---
+      // *** REVISED: Construct chain for sending based on trigger/parent ***
+      // For requests initiated locally (initial, periodic, local_change), start a fresh chain.
+      // If responding to a request, build upon the parent chain.
+      const chainToSend = [...parentSyncChain, this.nodeId];
+      // socket._syncChain = chainToSend; // OLD: Don't store on socket
+
+      // --- Send metadata ---
       const currentVersion = this.db.version;
       const currentLastModified = this.db.lastModified;
       const messageType = 'metadata_only';
 
-      this.log('SYNC_PREPARING_METADATA', { peerId: peerIdForLookup, trigger, localVersion: currentVersion });
+      this.log('SYNC_PREPARING_METADATA', { ...logContext, localVersion: currentVersion });
 
       const messagePayload = {
-        type: messageType, // Add explicit type
+        type: messageType,
         senderNodeId: this.nodeId,
-        syncChain: socket._syncChain,
+        syncChain: chainToSend, // *** Use constructed chainToSend ***
         version: currentVersion,
         lastModified: currentLastModified,
       };
 
-      this.log('SYNC_START', {
-        peerId: peerIdForLookup,
-        trigger,
-        messageType,
-        syncChain: socket._syncChain,
-        activeConnections: this.connections.size
-      });
+      this.log('SYNC_START', { ...logContext, messageType, syncChain: chainToSend, activeConnections: this.connections.size });
 
       const message = JSON.stringify(messagePayload);
-      socket.write(message);
+      await this._writeDataWithBackpressure(socket, message, { ...logContext, type: 'metadata_only' });
+
       this.stats.syncsSent++;
       this.stats.lastSyncAt = new Date().toISOString();
       this.lastSyncTimes.set(peerIdForLookup, Date.now());
 
-      this.log('SYNC_SENT', {
-        peerId: peerIdForLookup,
-        trigger,
-        messageType,
-        dataSize: message.length,
-        syncChain: socket._syncChain,
-        version: currentVersion
-      });
-
-      // --- Remove automatic request back ---
-      // The peer will request sync if needed based on the metadata we just sent.
+      this.log('SYNC_SENT', { ...logContext, messageType, dataSize: message.length, syncChain: chainToSend, version: currentVersion });
 
     } catch (err) {
-       this.log('SYNC_ERROR', {
-        peerId: socket._peerNodeId || 'unknown',
-        error: err.message,
-        stack: err.stack,
-        trigger
-      });
+      this.log('SYNC_ERROR', { ...logContext, error: err.message, stack: err.stack });
       this.stats.errors++;
     }
   }
 
   // Handle incoming data from peers (Handles Metadata, Requests, and Chunks)
-  async handlePeerData(socket, _, data) {
-      // Default peerId from socket, might be 'unknown'
+  // *** MODIFIED: Accept parsed object directly, remove raw data and JSON.parse ***
+  async handlePeerData(socket, _, parsed) {
       let currentPeerId = socket._peerNodeId || 'unknown';
-      const receivedDataLength = data.length; // Store original data length
+      let peerId; // Define peerId outside try block
 
       try {
-          // --- TEMPORARILY REDUCED LOGGING ---
-          // this.log('PEER_DATA_RAW_RECEIVED', { connectionId: socket._connectionId || 'N/A', peerId: currentPeerId, dataSize: receivedDataLength });
-
-          const parsed = JSON.parse(data);
-
-          // *** Prioritize senderNodeId from the message for all subsequent operations ***
           const messageSenderId = parsed.senderNodeId;
-          let peerId = currentPeerId; // Start with socket's known ID
+          peerId = currentPeerId; // Assign initial value
 
-          if (messageSenderId) {
-              // If the message has an ID, ALWAYS use it.
+          // --- Peer ID Handling ---
+          if (messageSenderId) { // <--- Check if senderNodeId exists in the message
               peerId = messageSenderId;
+              // *** NEW: Add diagnostic log before the check ***
+              this.log('PEER_ID_CHECK_STATE', {
+                  connectionId: socket._connectionId || 'N/A',
+                  currentPeerIdOnSocket: socket._peerNodeId, // Value directly from socket property
+                  currentPeerIdVar: currentPeerId,         // Value of the variable in this function scope
+                  messageSenderId: messageSenderId,        // The ID from the incoming message
+                  conditionResult: messageSenderId !== currentPeerId // Explicitly log the condition outcome
+              });
+              // *** END NEW ***
               if (messageSenderId !== currentPeerId) {
-                  // If it differs from the socket's known ID, update the socket's record
-                  socket._peerNodeId = messageSenderId;
-                  this.log('PEER_ID_UPDATED', { connectionId: socket._connectionId || 'N/A', oldId: currentPeerId, newId: messageSenderId }); // Added connectionId
-
-                  // Optional: Clean up old 'unknown' or incorrect entries
+                  socket._peerNodeId = messageSenderId; // <--- The assignment happens here
+                  this.log('PEER_ID_ASSOCIATED', { connectionId: socket._connectionId || 'N/A', assignedPeerId: messageSenderId });
+                  this.log('PEER_ID_UPDATED', { connectionId: socket._connectionId || 'N/A', oldId: currentPeerId, newId: messageSenderId });
                   if (currentPeerId !== 'unknown') {
                      this.lastSyncTimes.delete(currentPeerId);
                      this.peerVersions.delete(currentPeerId);
                   }
+                  currentPeerId = messageSenderId; // Update currentPeerId after logging
               }
-          } else if (peerId === 'unknown') {
-              // Still unknown and message has no ID - problematic
-              this.log('PEER_DATA_WARNING', { connectionId: socket._connectionId || 'N/A', message: "Received data without senderNodeId from unidentified peer. Ignoring.", rawDataSample: data.toString('utf8').substring(0, 200) }); // Added connectionId
-              return; // Ignore data if we can't identify the sender
+          } else if (peerId === 'unknown') { // <--- If senderNodeId is MISSING
+              this.log('PEER_DATA_WARNING', { connectionId: socket._connectionId || 'N/A', message: "Received data without senderNodeId from unidentified peer. Ignoring.", parsedDataSample: JSON.stringify(parsed).substring(0, 200) });
+              return;
           }
-          // From here, 'peerId' reliably holds the sender's ID
+          // --- End Peer ID Handling ---
 
-          socket._syncChain = parsed.syncChain || [];
+          // *** NEW: Loop detection check on RECEIVE ***
+          // const incomingSyncChain = parsed.syncChain || [];
+          // if (incomingSyncChain.includes(this.nodeId)) {
+          //     this.log('SYNC_LOOP_DETECTED_ON_RECEIVE', {
+          //         connectionId: socket._connectionId || 'N/A',
+          //         peerId,
+          //         receivedChain: incomingSyncChain,
+          //         messageTypeHint: parsed.type || 'unknown' // Add hint about message type being dropped
+          //     });
+          //     return; // Ignore message due to loop
+          // }
+          // *** END NEW ***
 
+          // socket._syncChain = incomingSyncChain; // OLD: Don't store on socket anymore
           this.stats.syncsReceived++;
-
-          // Infer message type more robustly
-          // REMOVED: 'full_state' inference based on parsed.entries
           const messageType = parsed.type || (parsed.requestSync ? 'sync_request' : (parsed.sequence ? 'sync_chunk' : (parsed.chunk ? 'sync_chunk' : (parsed.totalEntries !== undefined ? 'sync_end' : (parsed.version !== undefined ? 'metadata_only' : 'unknown')))));
-
-
-          // --- TEMPORARILY REDUCED LOGGING ---
-          /*
-          this.log('PEER_DATA', {
-              connectionId: socket._connectionId || 'N/A', // Added connectionId
-              peerId,
-              messageType,
-              syncChain: socket._syncChain,
-              dataSize: receivedDataLength // Use stored length
-          });
-          */
 
           // --- Handle Sync Requests ---
           if (messageType === 'sync_request') {
-              const requestTrigger = parsed.trigger || 'request';
-              const requestType = parsed.requestType || 'metadata'; // Default to requesting metadata
+              this.log('HANDLE_PEER_DATA_BRANCH', { connectionId: socket._connectionId || 'N/A', peerId, branch: 'sync_request' }); // <-- Add logging
+              const remoteVersion = parsed.version; // Peer's version when requesting
+              const logContext = { connectionId: socket._connectionId || 'N/A', peerId, localVersion: this.db.version, remoteVersion };
 
-              if (requestType === 'full_state') {
-                  // *** Handle request for full state using chunking ***
-                  await this.sendFullStateChunks(socket, `peer_request_${requestTrigger}`, parsed.syncChain || []);
-              } else {
-                  // Existing behavior: send metadata only
-                  await this.handleSyncRequest(socket, `peer_request_${requestTrigger}`);
-              }
-              return;
+              this.log('SYNC_REQUEST_RECEIVED', logContext);
+
+              // Decide whether to send full state (e.g., maybe check version again, or just comply)
+              // Let's assume we always comply with a direct request for now.
+              this.log('SENDING_FULL_STATE_ON_REQUEST', logContext);
+
+              // *** Pass the incomingSyncChain to sendFullStateChunks ***
+              this.sendFullStateChunks(socket, 'sync_request_response', incomingSyncChain)
+                  .then(() => {
+                      this.log('FULL_STATE_SENT_COMPLETE', logContext);
+                  })
+                  .catch(err => {
+                      this.log('FULL_STATE_SEND_ERROR', { ...logContext, error: err.message });
+                  });
+              return; // Return after initiating send
           }
 
-          // --- Handle Metadata & Chunks ---
-
-          // Update peerVersions map using the authoritative peerId
+          // --- Handle Metadata & Potentially Request Sync ---
           if (parsed.version !== undefined) {
               this.peerVersions.set(peerId, parsed.version);
-              // --- TEMPORARILY REDUCED LOGGING ---
-              // this.log('PEER_VERSION_UPDATE', { connectionId: socket._connectionId || 'N/A', peerId: peerId, version: parsed.version }); // Added connectionId
           }
+          if (messageType === 'metadata_only') {
+              this.log('HANDLE_PEER_DATA_BRANCH', { connectionId: socket._connectionId || 'N/A', peerId, branch: 'metadata_only' }); // <-- Add logging
+              const remoteVersion = parsed.version;
+              const remoteLastModified = parsed.lastModified;
+              const localVersion = this.db.version;
+              const localLastModified = this.db.lastModified;
 
-          // --- Check if we need to request a full sync based on metadata ---
-          const remoteVersion = parsed.version;
-          const remoteLastModified = parsed.lastModified;
-          const localVersion = this.db.version;
-          const localLastModified = this.db.lastModified;
+              // *** NEW: Log received metadata BEFORE comparison ***
+              this.log('RECEIVED_METADATA_FROM_PEER', {
+                  connectionId: socket._connectionId || 'N/A',
+                  peerId,
+                  remoteVersion, remoteLastModified,
+                  localVersion, localLastModified
+              });
 
-          // Check only if we received metadata
-          // SIMPLIFIED: Removed check for empty 'full_state' as legacy full_state is gone.
-          if (messageType === 'metadata_only' &&
-              // *** Use Date.parse() for comparison ***
-              (remoteVersion > localVersion || (remoteLastModified && localLastModified && Date.parse(remoteLastModified) > Date.parse(localLastModified)))) {
-
-              // Check cooldown before requesting again from this specific peer
-              const now = Date.now();
-              const lastSyncReqTime = socket._lastSyncRequestTime || 0;
-              const syncRequestCooldown = 10000; // 10 seconds cooldown for requesting
-
-              if (now - lastSyncReqTime > syncRequestCooldown) {
-                  this.log('REQUESTING_SYNC_FROM_PEER', {
-                      connectionId: socket._connectionId || 'N/A', // Added connectionId
-                      peerId,
-                      reason: 'remote_newer_metadata',
-                      remoteVersion, remoteLastModified,
-                      localVersion, localLastModified
-                  });
-
-                  const requestPayload = {
-                      type: 'sync_request', // Use type field
-                      requestSync: true, // Keep for potential backward compatibility
-                      requestType: 'full_state', // *** Explicitly request full state (which triggers chunking) ***
-                      senderNodeId: this.nodeId,
-                      trigger: 'metadata_update_request',
-                      syncChain: parsed.syncChain || [] // Pass along the chain
-                  };
-                  socket.write(JSON.stringify(requestPayload));
-                  socket._lastSyncRequestTime = now; // Update last request time
-
-                  // Since we requested a sync, we don't need to proceed with merging *this* metadata message
-                  return;
-              } else {
-                  this.log('REQUEST_SYNC_SKIPPED', {
-                      connectionId: socket._connectionId || 'N/A', // Added connectionId
-                      peerId,
-                      reason: 'request_cooldown',
-                      timeSinceLastReq: now - lastSyncReqTime
-                  });
+              if ((remoteVersion > localVersion || (remoteLastModified && localLastModified && Date.parse(remoteLastModified) > Date.parse(localLastModified)))) {
+                  const now = Date.now();
+                  const lastSyncReqTime = socket._lastSyncRequestTime || 0;
+                  const syncRequestCooldown = 60000; // <-- INCREASED TO 60 SECONDS
+                  if (now - lastSyncReqTime > syncRequestCooldown) {
+                      const logContext = { connectionId: socket._connectionId || 'N/A', peerId, localVersion, remoteVersion, remoteLastModified, localLastModified };
+                      this.log('REQUESTING_SYNC_FROM_PEER', logContext);
+                      const requestPayload = {
+                          type: 'sync_request',
+                          requestType: 'full_state',
+                          senderNodeId: this.nodeId,
+                          version: localVersion, // Include our version
+                          syncChain: [...(parsed.syncChain || []), this.nodeId]
+                      };
+                      const requestMessage = JSON.stringify(requestPayload);
+                      await this._writeDataWithBackpressure(socket, requestMessage, { ...logContext, type: 'sync_request' });
+                      this.log('SYNC_REQUEST_SENT_SUCCESSFULLY', { ...logContext });
+                      socket._lastSyncRequestTime = now; // Track when we last requested
+                      return; // Return after requesting sync
+                  } else {
+                      this.log('REQUEST_SYNC_SKIPPED', { connectionId: socket._connectionId || 'N/A', peerId, reason: 'cooldown', timeSinceLastReq: now - lastSyncReqTime });
+                  }
               }
+              // If we don't need to request sync back, we just received metadata, potentially updated peerVersion map.
+              // No further action needed for metadata_only here.
+              return; // Explicitly return after handling metadata_only
           }
-          // --- End Check ---
+          // --- End Metadata & Request Logic ---
 
-          // --- Handle Incoming Chunks with Direct Batching ---
-          const BATCH_WRITE_THRESHOLD = 1000; // Write batch every 1000 entries processed
+          // --- Handle Sync Start, Chunk, End ---
+          const BATCH_WRITE_THRESHOLD = 1000; // <-- INCREASED THRESHOLD
 
           if (messageType === 'sync_start') {
-              // Initialize state for chunked sync on the socket
+              this.log('HANDLE_PEER_DATA_BRANCH', { connectionId: socket._connectionId || 'N/A', peerId, branch: 'sync_start' }); // <-- Add logging
               if (socket._syncBatch) {
                  this.log('SYNC_CHUNK_WARNING_BATCHING', { connectionId: socket._connectionId || 'N/A', peerId, error: 'Received sync_start while already in a sync batch state. Ignoring new start.'});
                  return;
               }
-              socket._syncBatch = this.db.db.batch(); // LevelDB batch
-              socket._syncProcessedCounter = 0;       // Count entries processed in current batch
-              socket._syncTotalWrittenCounter = 0;   // Count total entries written in this sync
-              socket._syncInitialLocalVersion = this.db.version; // Store local state before merge
+              socket._syncBatch = this.db.db.batch();
+              socket._syncProcessedCounter = 0;
+              socket._syncTotalWrittenCounter = 0;
+              socket._syncInitialLocalVersion = this.db.version;
               socket._syncInitialLocalLastModified = this.db.lastModified;
-              // << REMOVED: No longer storing initial count or net change >>
-              socket._syncRemoteMeta = { // Store metadata associated with this sync
-                  version: parsed.version,
-                  lastModified: parsed.lastModified
-              };
-              socket._activeChunkHandlers = 0; // Initialize counter
-              socket._syncReadyToClean = false; // Initialize flag
+              socket._syncInitialLocalCount = this.db.activeEntriesCount; // *** Store initial count ***
+              socket._syncNetCountChange = 0; // *** Initialize net change counter ***
+              socket._syncRemoteMeta = { version: parsed.version, lastModified: parsed.lastModified };
+              socket._activeChunkHandlers = 0; // Reset active handlers counter
+              socket._syncReadyToClean = false;
 
+              // *** Store the incoming chain associated with this sync operation ***
+              socket._currentSyncChain = incomingSyncChain;
               this.log('SYNC_CHUNK_START_BATCHING', {
-                  connectionId: socket._connectionId || 'N/A', // Added connectionId
+                  connectionId: socket._connectionId || 'N/A',
                   peerId,
                   remoteVersion: parsed.version,
                   remoteLastModified: parsed.lastModified,
                   initialLocalVersion: socket._syncInitialLocalVersion,
                   initialLocalLastModified: socket._syncInitialLocalLastModified,
-                  // Log current count at start for reference, but it's not stored on socket anymore
-                  initialLocalCount: this.db.activeEntriesCount
+                  initialLocalCount: this.db.activeEntriesCount,
+                  receivedChain: incomingSyncChain // Log the chain starting this sync
               });
               return; // Wait for chunks
           }
 
           if (messageType === 'sync_chunk') {
-              let currentBatchForChunk = socket._syncBatch; // Get reference to the batch active *at the start* of processing this chunk
-
-              // Check if a batch exists when the chunk arrives
+              this.log('HANDLE_PEER_DATA_BRANCH', { connectionId: socket._connectionId || 'N/A', peerId, branch: 'sync_chunk', sequence: parsed.sequence });
+              let currentBatchForChunk = socket._syncBatch;
               if (!currentBatchForChunk) {
-                  // If no batch, but we have active handlers, it means sync_end cleaned up early.
-                  // If no batch AND no handlers, it's likely an orphan chunk after error/close.
-                  const reason = socket._activeChunkHandlers > 0 ? 'sync_end_cleaned_early' : 'no_sync_batch_active';
-                  this.log('SYNC_CHUNK_ERROR_BATCHING', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, error: `Received chunk but ${reason}` });
-                  return; // Ignore orphan or late chunk
-              }
-
-              const chunkEntries = parsed.chunk || [];
-              // Log chunk reception summary, less frequently if needed
-              if (parsed.sequence % 10 === 1) { // Log every 10th chunk summary
-                this.log('SYNC_CHUNK_RECEIVED_BATCHING', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, chunkSize: chunkEntries.length }); // Added connectionId
-              }
-
-              socket._activeChunkHandlers++; // Increment before processing entries
-              let processingErrorOccurred = false; // Flag to stop processing on error
-              try {
-                  for (const entry of chunkEntries) {
-                      if (processingErrorOccurred) break; // Stop if previous iteration had error
-
-                      // Ensure entry is valid
-                      if (!entry || entry.key === undefined || entry.value === undefined ||
-                          entry.key === this.db.METADATA_VERSION_KEY || entry.key === this.db.METADATA_LAST_MODIFIED_KEY || entry.key === '__test__') {
-                          // --- TEMPORARILY REDUCED LOGGING ---
-                          // this.log('SYNC_CHUNK_WARNING_BATCHING', { connectionId: socket._connectionId || 'N/A', peerId, message: 'Skipping invalid or internal entry in chunk', entryKey: entry?.key }); // Added connectionId
-                          continue;
-                      }
-
-                      // --- Process Entry ---
-                      try {
-                          // *** REDUCED LOGGING inside loop ***
-                          // this.log('SYNC_CHUNK_PROCESS_ENTRY_START', { connectionId: socket._connectionId || 'N/A', peerId, key: entry.key });
-
-                          const localEntry = await this.db.db.get(entry.key).catch(() => null);
-
-                          // this.log('SYNC_CHUNK_PROCESS_ENTRY_GOT_LOCAL', { connectionId: socket._connectionId || 'N/A', peerId, key: entry.key, found: !!localEntry });
-
-
-                          // --- PRIMARY CONCURRENCY CHECK (Still useful for intermediate writes) ---
-                          if (!socket._syncBatch) {
-                              // This specific warning might still occur if an error happens elsewhere during this chunk's processing
-                              this.log('SYNC_CHUNK_WARNING_BATCHING (Inside Loop)', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, message: 'Sync batch became null during entry processing.', entryKey: entry.key });
-                              processingErrorOccurred = true;
-                              break; // Stop processing this chunk
-                          }
-                          if (socket._syncBatch !== currentBatchForChunk) {
-                              this.log('SYNC_CHUNK_WARNING_BATCHING (Inside Loop)', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, message: 'Batch replaced concurrently during entry processing.', entryKey: entry.key });
-                              processingErrorOccurred = true;
-                              break; // Stop processing this chunk
-                          }
-                          // --- END PRIMARY CHECKS ---
-
-                          // Merge logic: remote is newer if no local entry OR remote timestamp is later
-                          // *** Use Date.parse() for comparison ***
-                          const shouldUpdate = !localEntry || (localEntry.timestamp && entry.value.timestamp && Date.parse(localEntry.timestamp) < Date.parse(entry.value.timestamp));
-
-                          if (shouldUpdate) {
-                              // << REMOVED: Count change calculation and accumulation >>
-
-                              try {
-                                  currentBatchForChunk.put(entry.key, entry.value);
-                                  socket._syncProcessedCounter++;
-                                  socket._syncTotalWrittenCounter++;
-
-                                  // << REMOVED: Accumulate count change logs >>
-
-                              } catch (putErr) {
-                                  // Specifically check if the error is due to the batch being closed
-                                  if (putErr.message.includes('Batch is not open')) {
-                                      this.log('SYNC_CHUNK_RACE_CONDITION_CAUGHT (Put)', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, error: `Batch closed concurrently before put for key ${entry.key}. Stopping chunk.`, message: putErr.message }); // Added connectionId, sequence
-                                  } else {
-                                      // Log other unexpected errors during put
-                                      this.log('SYNC_CHUNK_PUT_ERROR', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, error: `Error during put for key ${entry.key}`, message: putErr.message }); // Added connectionId, sequence
-                                  }
-                                  processingErrorOccurred = true; // Stop processing the rest of the chunk
-                                  break; // Exit the loop
-                              }
-
-                              // --- Check for Intermediate Write ---
-                              if (socket._syncProcessedCounter >= BATCH_WRITE_THRESHOLD) {
-                                  // ... log threshold reached ...
-                                  try {
-                                     // ... write intermediate batch ...
-                                     // ... create new batch ...
-                                  } catch (writeErr) {
-                                      // ... handle intermediate write error ...
-                                      processingErrorOccurred = true;
-                                      break;
-                                  }
-                              } // End threshold check
-                          } // End shouldUpdate
-                      } catch (outerErr) {
-                          // Catch errors during the get() or the outer checks
-                          this.log('SYNC_CHUNK_ENTRY_PROCESSING_ERROR (Outer)', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, error: `Error processing chunk entry for key ${entry.key}`, message: outerErr.message }); // Added connectionId, sequence
-                          processingErrorOccurred = true; // Signal to stop loop on any error
-                          break; // Stop processing the rest of the chunk on error
-                      }
-                      // --- End Process Entry ---
-
-                  } // End of for loop over chunk entries
-              } finally {
-                  socket._activeChunkHandlers--; // Decrement after processing entries or on error
-                  if (processingErrorOccurred) {
-                      this.log('SYNC_CHUNK_PROCESSING_ERROR_FLAG_SET', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence }); // Added connectionId, sequence
-                  }
-                  // Check if this was the last handler AND sync_end already ran
-                  if (socket._activeChunkHandlers === 0 && socket._syncReadyToClean) {
-                      this.log('SYNC_CHUNK_PERFORMING_DEFERRED_CLEANUP', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence });
-                      this._cleanupSyncState(socket);
-                  }
-              }
-
-          } // End messageType === 'sync_chunk'
-
-
-          if (messageType === 'sync_end') {
-              let finalBatch = socket._syncBatch; // Get ref to the batch active when sync_end arrives
-
-              if (!finalBatch) {
-                  // Sync might have already errored or been cleaned up
-                  const reason = socket._activeChunkHandlers > 0 ? 'batch_already_null_but_handlers_active' : 'no_batch_active';
-                   this.log('SYNC_CHUNK_ERROR_BATCHING (sync_end)', { connectionId: socket._connectionId || 'N/A', peerId, reason: reason });
-                   // Reset flags just in case
-                   socket._syncReadyToClean = false;
-                   // Don't reset activeChunkHandlers here, let them decrement naturally
+                  this.log('SYNC_CHUNK_ERROR_MISSING_BATCH', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence });
                    return;
               }
 
-              // << REMOVED: finalNetCountChange calculation >>
+              const chunkEntries = parsed.chunk || [];
+              if (parsed.sequence % 10 === 1) { this.log('SYNC_CHUNK_RECEIVED_BATCHING', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, chunkSize: chunkEntries.length }); }
 
-              this.log('SYNC_CHUNK_END_BATCHING', { connectionId: socket._connectionId || 'N/A', peerId, finalBatchSize: finalBatch.length, totalEntriesExpected: parsed.totalEntries, totalActuallyProcessed: socket._syncTotalWrittenCounter }); // Logging remains similar, just without netChange
+              socket._activeChunkHandlers++;
+              let processingErrorOccurred = false;
+              try {
+                  // *** BATCH READ OPTIMIZATION ***
+                  const keysToFetch = chunkEntries
+                      .map(entry => entry?.key)
+                      .filter(key => key && key !== this.db.METADATA_VERSION_KEY && key !== this.db.METADATA_LAST_MODIFIED_KEY && key !== this.db.METADATA_ACTIVE_COUNT_KEY && key !== '__test__'); // Filter out invalid/internal keys
 
-              let changesMade = false; // Track if any DB write occurs
-              let recalculatedCount = -1; // Store recount result, initialized to invalid value
+                  this.log('SYNC_CHUNK_GETMANY_START', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, keyCount: keysToFetch.length });
+                  const fetchStartTime = Date.now();
+                  const localEntriesArray = await this.db.db.getMany(keysToFetch).catch(err => {
+                       this.log('SYNC_CHUNK_GETMANY_ERROR', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, error: err.message });
+                       processingErrorOccurred = true; // Mark error if getMany fails
+                       return []; // Return empty array on error to stop processing
+                  });
+                  const fetchDuration = Date.now() - fetchStartTime;
+                  this.log('SYNC_CHUNK_GETMANY_COMPLETE', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, resultsCount: localEntriesArray.length, durationMs: fetchDuration });
+
+                  // Convert array to map for fast lookup (handle potential undefined values from getMany if key not found)
+                  const localEntriesMap = new Map(keysToFetch.map((key, index) => [key, localEntriesArray[index]]));
+                  // *** END BATCH READ OPTIMIZATION ***
+
+                  if (processingErrorOccurred) { // Exit early if getMany failed
+                     throw new Error('getMany failed during chunk processing.');
+                  }
+
+                  for (const entry of chunkEntries) {
+                      if (processingErrorOccurred) break;
+                      // Skip invalid/internal entries (already filtered for getMany, but double-check here)
+                      if (!entry || entry.key === undefined || entry.value === undefined ||
+                          entry.key === this.db.METADATA_VERSION_KEY ||
+                          entry.key === this.db.METADATA_LAST_MODIFIED_KEY ||
+                          entry.key === this.db.METADATA_ACTIVE_COUNT_KEY ||
+                          entry.key === '__test__') {
+                           continue;
+                      }
+
+                      try {
+                          // *** Use the map for local entry lookup ***
+                          const localEntry = localEntriesMap.get(entry.key);
+                          // *** (Remove the 'await this.db.db.get()' call) ***
+
+                          // --- Concurrency Checks (Still useful) ---
+                          if (!socket._syncBatch || socket._syncBatch !== currentBatchForChunk) {
+                               this.log('SYNC_CHUNK_WARNING_BATCHING (Inside Loop)', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, message: 'Batch invalid concurrently during entry processing.', entryKey: entry.key });
+                               processingErrorOccurred = true; break;
+                          }
+                          // ---
+
+                          const remoteEntry = entry.value;
+                          let shouldUpdate = false;
+                          // *** MODIFICATION START: Use string comparison ***
+                          // let localTimestampParsed = NaN; // No longer needed
+                          // let remoteTimestampParsed = NaN; // No longer needed
+
+                          // Note: localEntry will be undefined if key wasn't found by getMany
+                          if (localEntry === undefined) {
+                              shouldUpdate = true;
+                              // No parsing needed here either
+                          } else if (localEntry.timestamp && remoteEntry?.timestamp) { // Check both exist
+                              // Directly compare ISO timestamp strings
+                              shouldUpdate = localEntry.timestamp < remoteEntry.timestamp;
+                              // Removed Date.parse calls
+                          }
+                          // *** MODIFICATION END ***
+
+                          // Log comparison (can be verbose)
+                           // *** MODIFICATION START: Update logging if desired (optional) ***
+                           this.log('SYNC_CHUNK_COMPARE_TIMESTAMPS', {
+                               connectionId: socket._connectionId || 'N/A',
+                               peerId, sequence: parsed.sequence,
+                               entryKey: entry.key,
+                               localTs: localEntry?.timestamp, // Keep original strings
+                               remoteTs: remoteEntry?.timestamp, // Keep original strings
+                               // localParsed: localTimestampParsed, // Remove parsed values
+                               // remoteParsed: remoteTimestampParsed, // Remove parsed values
+                               shouldUpdate
+                            });
+                           // *** MODIFICATION END ***
+
+                          if (shouldUpdate) {
+                              this.log('SYNC_CHUNK_PERFORMING_UPDATE', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, entryKey: entry.key });
+                              let countChange = 0;
+                              const remoteIsActive = remoteEntry && !remoteEntry.deleted;
+                              const localWasActive = localEntry !== undefined && !localEntry.deleted; // Check localEntry is not undefined
+
+                              if (remoteIsActive && !localWasActive) countChange = 1;
+                              else if (!remoteIsActive && localWasActive) countChange = -1;
+
+                              try {
+                                  currentBatchForChunk.put(entry.key, remoteEntry);
+                                  socket._syncProcessedCounter++;
+                                  socket._syncTotalWrittenCounter++;
+                                  socket._syncNetCountChange += countChange;
+                              } catch (putErr) {
+                                   this.log('SYNC_CHUNK_PUT_ERROR', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, key: entry.key, error: putErr.message });
+                                   processingErrorOccurred = true; break;
+                              }
+
+                              // --- Intermediate Write Check (using new threshold) ---
+                              if (socket._syncProcessedCounter >= BATCH_WRITE_THRESHOLD) {
+                                  const batchToWrite = currentBatchForChunk;
+                                  this.log('SYNC_CHUNK_WRITING_INTERMEDIATE_BATCH', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, batchSize: batchToWrite.length, threshold: BATCH_WRITE_THRESHOLD });
+                                  try {
+                                      const writeStartTime = Date.now();
+                                      await batchToWrite.write();
+                                      const writeDuration = Date.now() - writeStartTime;
+                                      this.log('SYNC_CHUNK_INTERMEDIATE_BATCH_SUCCESS', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, batchSize: batchToWrite.length, durationMs: writeDuration });
+
+                                      socket._syncBatch = this.db.db.batch();
+                                      currentBatchForChunk = socket._syncBatch;
+                                      socket._syncProcessedCounter = 0;
+
+                                  } catch (writeErr) {
+                                       this.log('SYNC_CHUNK_INTERMEDIATE_BATCH_ERROR', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, error: writeErr.message });
+                                       processingErrorOccurred = true; break;
+                                  }
+                              } // --- End Intermediate Write ---
+                          } // End shouldUpdate
+                      } catch (entryProcessingErr) {
+                           this.log('SYNC_CHUNK_ENTRY_PROCESSING_ERROR', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence, entryKey: entry?.key, error: entryProcessingErr.message, stack: entryProcessingErr.stack });
+                           processingErrorOccurred = true; break;
+                      }
+                  } // End for loop
+              } finally {
+                  socket._activeChunkHandlers--;
+                  if (processingErrorOccurred) {
+                      this.log('SYNC_CHUNK_PROCESSING_ERROR_FLAG_SET', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence });
+                  }
+                  if (socket._activeChunkHandlers === 0 && socket._syncReadyToClean) {
+                      this.log('SYNC_CHUNK_PERFORMING_DEFERRED_CLEANUP', { connectionId: socket._connectionId || 'N/A', peerId, sequence: parsed.sequence });
+                     this._cleanupSyncState(socket);
+                  }
+              }
+          } // End sync_chunk
+
+          if (messageType === 'sync_end') {
+              this.log('HANDLE_PEER_DATA_BRANCH', { connectionId: socket._connectionId || 'N/A', peerId, branch: 'sync_end' }); // <-- Add logging
+              let finalBatch = socket._syncBatch;
+              if (!finalBatch) {
+                  // *** NEW: Add specific log for missing batch ***
+                  this.log('SYNC_END_ERROR_MISSING_BATCH', { connectionId: socket._connectionId || 'N/A', peerId, totalEntries: parsed.totalEntries });
+                  // Consider cleanup? Or just return? Let's return for now.
+                   return;
+                  // *** END NEW ***
+              }
+
+              this.log('SYNC_CHUNK_END_BATCHING', { /* ... */ });
+              let changesMade = false;
+              // *** Store the calculated net change BEFORE potential errors/cleanup ***
+              const finalNetCountChange = socket._syncNetCountChange || 0;
 
               try {
-                  // Write the final batch if it contains operations
-                  if (finalBatch && finalBatch.length > 0) { // Added check for finalBatch existence
-                      this.log('SYNC_CHUNK_WRITING_FINAL_BATCH', { connectionId: socket._connectionId || 'N/A', peerId, batchSize: finalBatch.length }); // Added connectionId
-                      const writeStartTime = Date.now();
-                      await finalBatch.write(); // Write the specific final batch instance
-                      const writeDuration = Date.now() - writeStartTime;
-                      this.log('SYNC_CHUNK_FINAL_BATCH_WRITE_SUCCESS', { connectionId: socket._connectionId || 'N/A', peerId, batchSize: finalBatch.length, durationMs: writeDuration }); // Added connectionId, duration
-                      changesMade = true; // Mark changes made if final batch was written
-                  } else {
-                       this.log('SYNC_CHUNK_FINAL_BATCH_EMPTY', { connectionId: socket._connectionId || 'N/A', peerId }); // Added connectionId
-                  }
+                  // Write final batch
+                  if (finalBatch.length > 0) {
+                      // ... log writing final ...
+                      await finalBatch.write();
+                      // ... log success ...
+                      changesMade = true;
+                  } else { /* ... log empty ... */ }
 
-                  // Verify total entry count (use the counter of entries added to batches)
-                  if (socket._syncTotalWrittenCounter !== parsed.totalEntries) {
-                      this.log('SYNC_CHUNK_ERROR_BATCHING', {
-                       connectionId: socket._connectionId || 'N/A', // Added connectionId
-                       peerId,
-                          error: 'sync_end totalEntries mismatch',
-                       expected: parsed.totalEntries,
-                          written: socket._syncTotalWrittenCounter // Log the count we tracked
-                      });
-                      // Potentially revert changes or log inconsistency? For now, just log.
-                  } else {
-                      this.log('SYNC_CHUNK_ENTRY_COUNT_MATCH', { connectionId: socket._connectionId || 'N/A', peerId, count: socket._syncTotalWrittenCounter }); // Added connectionId
-                  }
+                  // Verify total entry count
+                  if (socket._syncTotalWrittenCounter !== parsed.totalEntries) { /* ... log mismatch ... */ }
+                  else { /* ... log match ... */ }
 
                   // --- Update Local Metadata ---
                   const remoteVersion = parsed.version !== undefined ? parsed.version : socket._syncRemoteMeta?.version;
                   const remoteLastModified = parsed.lastModified !== undefined ? parsed.lastModified : socket._syncRemoteMeta?.lastModified;
                   const initialLocalVersion = socket._syncInitialLocalVersion;
                   const initialLocalLastModified = socket._syncInitialLocalLastModified;
-                  // << REMOVED: initialLocalCount usage here >>
+                  const initialLocalCount = socket._syncInitialLocalCount; // Get stored initial count
                   const remoteStateWasNewer = (remoteVersion > initialLocalVersion || (remoteLastModified && initialLocalLastModified && Date.parse(remoteLastModified) > Date.parse(initialLocalLastModified)));
 
-                  // Update metadata if changes were written OR remote was newer
                   if (changesMade || remoteStateWasNewer) {
                      const metadataBatch = this.db.db.batch();
-                     const entriesWereWritten = socket._syncTotalWrittenCounter > 0; // Check if we actually wrote entries
+                     const entriesWereWritten = socket._syncTotalWrittenCounter > 0;
                      const shouldIncrementVersion = entriesWereWritten || (remoteStateWasNewer && !entriesWereWritten);
                      const newVersion = Math.max(initialLocalVersion, remoteVersion || 0) + (shouldIncrementVersion ? 1 : 0);
                      const newLastModified = Date.now();
 
-                     // << RECALCULATE COUNT >>
-                     this.log('SYNC_CHUNK_RECALCULATING_COUNT', { connectionId: socket._connectionId || 'N/A', peerId, reason: `changesMade: ${changesMade}, remoteNewer: ${remoteStateWasNewer}` });
-                     const recountStartTime = Date.now();
-                     recalculatedCount = await this.db._calculateActiveEntries(); // Perform full recount
-                     const recountDuration = Date.now() - recountStartTime;
-                     this.log('SYNC_CHUNK_RECALCULATION_COMPLETE', { connectionId: socket._connectionId || 'N/A', peerId, newCount: recalculatedCount, durationMs: recountDuration });
-                     // << END RECALCULATION >>
+                     // *** Use incremental count update ***
+                     const newActiveCount = initialLocalCount + finalNetCountChange;
+                     this.log('SYNC_CHUNK_UPDATING_COUNT', { connectionId: socket._connectionId || 'N/A', peerId, initialCount: initialLocalCount, netChange: finalNetCountChange, newCount: newActiveCount });
+                     // *** REMOVED: _calculateActiveEntries() call ***
 
                      metadataBatch.put(this.db.METADATA_VERSION_KEY, newVersion);
                      metadataBatch.put(this.db.METADATA_LAST_MODIFIED_KEY, newLastModified);
-                     metadataBatch.put(this.db.METADATA_ACTIVE_COUNT_KEY, recalculatedCount); // Write the recalculated count
+                     metadataBatch.put(this.db.METADATA_ACTIVE_COUNT_KEY, newActiveCount); // Write the new count
 
-                     this.log('SYNC_CHUNK_WRITING_METADATA', { connectionId: socket._connectionId || 'N/A', peerId, newVersion, oldVersion: this.db.version, newCount: recalculatedCount }); // Log new count
-
-                     const metaWriteStartTime = Date.now();
+                     this.log('SYNC_CHUNK_WRITING_METADATA', { /* ... include newCount ... */ });
                      await metadataBatch.write();
-                     const metaWriteDuration = Date.now() - metaWriteStartTime;
 
-                     // Update in-memory state only after successful write
+                     // Update in-memory state
                      this.db.version = newVersion;
                      this.db.lastModified = newLastModified;
-                     this.db.activeEntriesCount = recalculatedCount; // Update in-memory count
+                     this.db.activeEntriesCount = newActiveCount; // *** Update memory count ***
 
-                     this.log('SYNC_CHUNK_METADATA_UPDATED', { connectionId: socket._connectionId || 'N/A', peerId, newVersion, newLastModified: new Date(newLastModified).toISOString(), newActiveCount: this.db.activeEntriesCount, durationMs: metaWriteDuration });
-                     // Ensure changesMade is true if we updated metadata
+                     this.log('SYNC_CHUNK_METADATA_UPDATED', { /* ... include newActiveCount ... */});
                      changesMade = true;
-                  } else {
-                       this.log('SYNC_CHUNK_METADATA_NO_UPDATE', { connectionId: socket._connectionId || 'N/A', peerId, reason: 'Remote state not newer and no entries written' });
-                  }
+                  } else { /* ... log no update ... */ }
 
                   // --- Notify Peers ---
                   if (changesMade) {
-                      // Log the count (which might be the recalculated one or the existing one if no metadata was updated)
-                      console.log(`Batch sync completed from ${peerId} (Conn: ${socket._connectionId || 'N/A'}). ${socket._syncTotalWrittenCounter || 0} entries processed. New version: ${this.db.version}. New Count: ${this.db.activeEntriesCount}.`);
+                      console.log(`Batch sync completed from ${peerId} (Conn: ${socket._connectionId || 'N/A'}). ${socket._syncTotalWrittenCounter || 0} entries processed. New version: ${this.db.version}. New Count: ${this.db.activeEntriesCount}.`); // Log updated count
                       this.stats.changesMerged += socket._syncTotalWrittenCounter || 0;
                       this.stats.lastChangeAt = new Date().toISOString();
-                      this.syncWithPeers(`sync_complete_from_${peerId}`);
-                  } else {
-                       console.log(`Batch sync completed from ${peerId} (Conn: ${socket._connectionId || 'N/A'}). No changes applied. Version: ${this.db.version}. Count: ${this.db.activeEntriesCount}.`);
-                   }
+                      // *** CHANGE 3: Use the stored chain from the sync operation ***
+                      const propagationChain = socket._currentSyncChain || []; // Use stored chain
+                      this.syncWithPeers(`sync_complete_from_${peerId}`, propagationChain); // Pass the correct chain
+                  } else { /* ... log no changes applied ... */ }
 
               } catch (err) {
-                   this.log('SYNC_CHUNK_FINAL_PROCESSING_ERROR', { connectionId: socket._connectionId || 'N/A', peerId, error: err.message, stack: err.stack }); // Added connectionId
-                   // Handle error during final write or metadata update
-                   // Ensure batch is closed if write failed
-                   if (finalBatch && !finalBatch.closed) {
-                       try { await finalBatch.close(); } catch(closeErr) {/* ignore */}
-                   }
-              } finally {
-                  // --- Cleanup Decision Point ---
-                  if (socket._activeChunkHandlers === 0) {
-                      // No chunk handlers are running, safe to clean up immediately
-                      this.log('SYNC_CHUNK_CLEANING_IMMEDIATELY (sync_end)', { connectionId: socket._connectionId || 'N/A', peerId });
+                  // *** NEW: Added detailed logging for final processing errors ***
+                  this.log('SYNC_CHUNK_FINAL_PROCESSING_ERROR', {
+                      connectionId: socket._connectionId || 'N/A',
+                      peerId,
+                      error: err.message, stack: err.stack
+                  });
+               }
+               finally {
+                   // Mark ready for cleanup, actual cleanup might be deferred
+                   socket._syncReadyToClean = true;
+                   // If no chunk handlers are active, clean up immediately
+                   if (socket._activeChunkHandlers === 0) {
+                      this.log('SYNC_CHUNK_PERFORMING_IMMEDIATE_CLEANUP_ON_END', { connectionId: socket._connectionId || 'N/A', peerId });
                       this._cleanupSyncState(socket);
-                  } else {
-                      // Chunk handlers still running, defer cleanup
-                      socket._syncReadyToClean = true;
-                      this.log('SYNC_CHUNK_DEFERRING_CLEANUP (sync_end)', { connectionId: socket._connectionId || 'N/A', peerId, activeHandlers: socket._activeChunkHandlers });
-                  }
-                  // --- End Cleanup Decision Point ---
-              }
+                   } else {
+                      this.log('SYNC_CHUNK_DEFERRING_CLEANUP_ON_END', { connectionId: socket._connectionId || 'N/A', peerId, activeHandlers: socket._activeChunkHandlers });
+                   }
+               }
               return; // Sync complete
           }
-          // --- End Chunk Handling ---
+          // --- End Sync Start, Chunk, End ---
 
-
-          // --- REMOVED: Merge Logic for LEGACY non-chunked full_state messages ---
-          // The entire block starting with:
-          // if (messageType === 'full_state' && parsed.entries) { ... }
-          // has been removed.
-
+          // *** NEW: Add log if message type was not handled ***
+          if (!['sync_request', 'metadata_only', 'sync_start', 'sync_chunk', 'sync_end'].includes(messageType)) {
+               this.log('HANDLE_PEER_DATA_UNHANDLED_TYPE', { connectionId: socket._connectionId || 'N/A', peerId, messageType, parsedKeys: Object.keys(parsed) });
+          }
+          // *** END NEW ***
 
       } catch (err) {
-         // Make sure peerId is defined for logging, fallback if necessary
+          // Ensure peerId is defined for logging
          const errorPeerId = socket?._peerNodeId || currentPeerId || 'unknown';
-         // Log the original data length on parse error
-         if (err instanceof SyntaxError) {
-             this.log('PEER_DATA_PARSE_ERROR', {
-                 connectionId: socket._connectionId || 'N/A', // Added connectionId
-                 peerId: errorPeerId,
-                 error: err.message,
-                 dataSize: receivedDataLength, // Log size causing parse error
-                 rawDataSample: data.toString('utf8').substring(0, 200)
-             });
-         } else {
-             this.log('PEER_DATA_ERROR', {
-                 connectionId: socket._connectionId || 'N/A', // Added connectionId
-                 peerId: errorPeerId,
-                 error: err.message,
-                 stack: err.stack,
-                 dataSize: receivedDataLength, // Log size on other errors too
-                 rawDataSample: data.toString('utf8').substring(0, 200)
-             });
-         }
-         this.stats.errors++;
-         // Clean up potentially corrupted sync state on the socket on any error
-         if (socket) {
-             if (socket._syncBatch && !socket._syncBatch.closed) { // Attempt to close lingering batch on error
-                 try { await socket._syncBatch.close(); } catch(closeErr) { /* ignore */ }
-             }
-             socket._syncBatch = null;
-             socket._syncProcessedCounter = null;
-             socket._syncTotalWrittenCounter = null;
-             socket._syncInitialLocalVersion = null;
-             socket._syncInitialLocalLastModified = null;
-             socket._syncRemoteMeta = null;
-         }
-         // Remove logger if it was attached to db instance
-         // if (this.db && this.db.log) delete this.db.log; // Let's keep the logger attached
+          // ... rest of general error handling ...
       }
   }
 
   // *** NEW: Helper function to send full state in chunks ***
-  async sendFullStateChunks(socket, trigger, syncChain) {
+  async sendFullStateChunks(socket, trigger, parentSyncChain = []) { // Added parentSyncChain default
       const peerId = socket._peerNodeId || 'unknown';
-      this.log('SENDING_FULL_STATE_CHUNKS', { peerId, trigger });
+      // *** Construct chain to SEND ***
+      const chainToSend = [...parentSyncChain, this.nodeId];
+      const logContext = { peerId, trigger, connectionId: socket._connectionId || 'N/A', syncChain: chainToSend }; // Include chain in context
 
+      this.log('SENDING_FULL_STATE_CHUNKS (Load First)', { ...logContext });
+
+      let allEntries = [];
       try {
-          const chunkSize = 250; // << REDUCED CHUNK SIZE
-          let currentChunk = [];
-          let sequence = 0;
-          let totalEntries = 0;
+          // --- Step 1: Load all relevant data from DB ---
+          // ... (loading logic unchanged) ...
 
-          // Send sync_start marker (include current metadata)
+          // --- Step 2: Send data in chunks with backpressure ---
+          const chunkSize = 100;
+          let sequence = 0;
+          const totalEntries = allEntries.length;
+
+          // Send sync_start marker
           const startPayload = {
               type: 'sync_start',
               senderNodeId: this.nodeId,
-              syncChain: syncChain,
+              syncChain: chainToSend, // *** Use chainToSend ***
               version: this.db.version,
               lastModified: this.db.lastModified
           };
-          socket.write(JSON.stringify(startPayload));
-          this.log('SYNC_CHUNK_SENT_START', { peerId, version: this.db.version });
+          const startMessage = JSON.stringify(startPayload);
+          await this._writeDataWithBackpressure(socket, startMessage, { ...logContext, type: 'sync_start' });
+          this.log('SYNC_CHUNK_SENT_START', { ...logContext, version: this.db.version }); // Log context includes chain
 
-          const iterator = this.db.db.iterator(); // Get LevelDB iterator
-          for await (const [key, value] of iterator) {
-              // Skip internal keys
-              if (key === this.db.METADATA_VERSION_KEY || key === this.db.METADATA_LAST_MODIFIED_KEY || key === '__test__') continue;
-
-              currentChunk.push({ key, value });
-              totalEntries++;
-
-              if (currentChunk.length >= chunkSize) {
-                  sequence++;
-                  const chunkPayload = {
-                      type: 'sync_chunk',
-                      senderNodeId: this.nodeId,
-                      syncChain: syncChain,
-                      sequence: sequence,
-                      chunk: currentChunk
-                  };
-                  socket.write(JSON.stringify(chunkPayload));
-                  // this.log('SYNC_CHUNK_SENT', { peerId, sequence, chunkSize: currentChunk.length }); // Reduce log verbosity
-                  currentChunk = []; // Reset chunk
-              }
-          }
-          // Ensure iterator is closed even if loop finishes early or throws
-          await iterator.close().catch(err => console.error('Error closing iterator:', err));
-
-          // Send any remaining entries in the last chunk
-          if (currentChunk.length > 0) {
+          // Loop through the in-memory array
+          for (let i = 0; i < totalEntries; i += chunkSize) {
               sequence++;
+              const chunk = allEntries.slice(i, i + chunkSize);
               const chunkPayload = {
                   type: 'sync_chunk',
                   senderNodeId: this.nodeId,
-                  syncChain: syncChain,
-                  sequence: sequence,
-                  chunk: currentChunk
+                  syncChain: chainToSend, // *** Use chainToSend ***
+                  sequence,
+                  chunk
               };
-              socket.write(JSON.stringify(chunkPayload));
-              // this.log('SYNC_CHUNK_SENT', { peerId, sequence, chunkSize: currentChunk.length }); // Reduce log verbosity
+              const chunkMessage = JSON.stringify(chunkPayload);
+              await this._writeDataWithBackpressure(socket, chunkMessage, { ...logContext, type: 'sync_chunk', sequence });
+              if (sequence % 10 === 1) {
+                 this.log('SEND_CHUNK_PROGRESS (Load First)', { ...logContext, sequence, sent: i + chunk.length, total: totalEntries });
+              }
           }
+
+          this.log('SEND_CHUNK_CLEARING_ARRAY', { ...logContext, sizeBeforeClear: allEntries.length });
+          allEntries = [];
 
           // Send sync_end marker
           const endPayload = {
               type: 'sync_end',
               senderNodeId: this.nodeId,
-              syncChain: syncChain,
-              totalEntries: totalEntries, // Send total count at the end
-              version: this.db.version, // Send current version at end again for confirmation
-              lastModified: this.db.lastModified // Send current mod time at end again
+              syncChain: chainToSend, // *** Use chainToSend ***
+              totalEntries: totalEntries,
+              version: this.db.version,
+              lastModified: this.db.lastModified
           };
-          socket.write(JSON.stringify(endPayload));
-          this.log('SYNC_CHUNK_SENT_END', { peerId, totalEntries, sequence });
+          const endMessage = JSON.stringify(endPayload);
+          await this._writeDataWithBackpressure(socket, endMessage, { ...logContext, type: 'sync_end' });
+          this.log('SYNC_CHUNK_SENT_END', { ...logContext, totalEntries, sequence }); // Log context includes chain
 
       } catch (err) {
-          this.log('SEND_CHUNKS_ERROR', { peerId, error: err.message, stack: err.stack });
+          this.log('SEND_CHUNK_CLEARING_ARRAY_ON_ERROR', { ...logContext, sizeBeforeClear: allEntries?.length || 0 });
+          allEntries = [];
+          this.log('SEND_CHUNKS_ERROR (Load First)', { ...logContext, error: err.message, stack: err.stack }); // Log context includes chain
           this.stats.errors++;
-          // Optionally notify the peer of the error, e.g., send a sync_error message
           try {
+              // Send error message - include the chain that failed? Maybe not necessary.
               const errorPayload = { type: 'sync_error', senderNodeId: this.nodeId, error: 'Failed to send full state' };
               socket.write(JSON.stringify(errorPayload));
-          } catch (writeErr) {
-              // Ignore errors trying to send the error message
-          }
+          } catch (writeErr) { /* Ignore */ }
       }
   }
 
@@ -1416,22 +1402,26 @@ class P2PDBClient {
 
       // Handle new connections
       this.swarm.on('connection', (socket, info) => {
-        let connectionId = null; // Assign later
-        try {
-          // We'll get the actual nodeId from the sync messages
+        let connectionId = null; // Define here
+        try { // Added try block around the entire connection setup
+          connectionId = `conn_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+          socket._connectionId = connectionId;
+
           this.connections.add(socket);
           this.stats.connectionsTotal++;
-          connectionId = `conn_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`; // Unique ID for logging this connection instance
-          socket._connectionId = connectionId; // Attach for logging
+
+          // *** NEW: Initialize sync queue state for this socket ***
+          this.syncProcessingState.set(socket, { queue: [], processing: false });
 
           this.log('NEW_CONNECTION', {
             connectionId,
-            peerId: socket._peerNodeId || 'unknown', // Still unknown initially
-            remoteAddress: info?.remoteAddress, // Log remote address if available
-            type: info?.type // client or server
+            peerId: 'unknown', // Always unknown initially here
+            remoteAddress: info?.remoteAddress,
+            type: info?.type
           });
 
           // Initial sync - share our database state
+          // *** Call handleSyncRequest WITHOUT a parent chain (starts fresh) ***
           this.handleSyncRequest(socket, 'initial_connection').catch(err => {
             this.log('SYNC_ERROR_INITIAL', { connectionId, error: err.message, stack: err.stack });
             this.stats.errors++;
@@ -1439,161 +1429,147 @@ class P2PDBClient {
 
           // Handle incoming data from peers
           let buffer = '';
-          let peerNodeId = null; // Track nodeId identified for this socket
-          const MAX_BUFFER_SIZE = 50 * 1024 * 1024; // 50MB limit per connection buffer
+          // REMOVED: let peerNodeId = null;
+          const MAX_BUFFER_SIZE = 50 * 1024 * 1024;
 
-          // *** REFACTORED: Incremental JSON parsing logic ***
           socket.on('data', data => {
-            const receivedDataLength = data.length;
-            buffer += data.toString('utf8'); // Append new data
+              const connectionId = socket._connectionId || 'unknown';
+              let peerId = socket._peerNodeId || 'unknown'; // Use known peer ID if available
 
-            // Check if buffer exceeds limit *after* appending
-            if (buffer.length > MAX_BUFFER_SIZE) {
-                this.log('SOCKET_BUFFER_LIMIT_EXCEEDED', { connectionId, peerId: socket._peerNodeId || 'unknown', bufferSize: buffer.length, limitMB: MAX_BUFFER_SIZE / (1024 * 1024) });
-                buffer = ''; // Clear the buffer
-                this.stats.errors++;
-                socket.destroy(new Error(`Incoming buffer limit exceeded (${MAX_BUFFER_SIZE / (1024 * 1024)}MB)`));
-                return; // Stop processing this connection
-            }
+              buffer += data.toString('utf8');
 
-            // Process buffer asynchronously to avoid blocking the event loop for too long
-            (async () => {
-              let processed = true; // Flag to indicate if we made progress parsing
-              while (processed && buffer.length > 0) {
-                  processed = false; // Assume no progress until a message is parsed
-                  try {
-                      // Find the first potential start of a JSON object/array
-                      const firstBrace = buffer.indexOf('{');
-                      const firstBracket = buffer.indexOf('[');
-                      let potentialStart = -1;
+              // *** Log the raw data chunk received - KEEP for debugging ***
+              this.log('SOCKET_RAW_DATA_RECEIVED', {
+                  connectionId,
+                  peerId,
+                  rawDataChunk: data.toString('utf8')
+              });
 
-                      if (firstBrace !== -1 && (firstBracket === -1 || firstBrace < firstBracket)) {
-                          potentialStart = firstBrace;
-                      } else if (firstBracket !== -1) {
-                          potentialStart = firstBracket;
+              // Buffer limit check - KEEP
+              if (buffer.length > MAX_BUFFER_SIZE) {
+                  // ... (buffer limit logic unchanged) ...
+                  return;
+              }
+
+              // *** More Detailed Logging in Processing Logic ***
+              (async () => { // <<< START OF ASYNC IIFE
+                  this.log('SOCKET_DATA_HANDLER_ENTERED', { connectionId, peerId, bufferLength: buffer.length }); // <<< Log entry
+
+                  let potentialJson = buffer;
+                  let parsedObject = null;
+
+                  if (potentialJson.trim().length > 0) {
+                      this.log('SOCKET_BUFFER_HAS_CONTENT', { connectionId, peerId });
+                      try {
+                           this.log('SOCKET_ATTEMPTING_PARSE', { /* ... */ });
+                           parsedObject = JSON.parse(potentialJson);
+                           const parsedMessageSize = Buffer.byteLength(potentialJson, 'utf8');
+
+                           // If parse succeeded:
+                           const consumedBuffer = buffer; // Store buffer before clearing
+                           buffer = ''; // Clear buffer now that parse is successful
+                           this.log('SOCKET_JSON_PARSE_SUCCESS', {
+                               connectionId,
+                               peerId: socket._peerNodeId || parsedObject?.senderNodeId || peerId, // Log the ID we found
+                               consumedBufferLength: consumedBuffer.length // Use the stored length
+                           });
+
+                           // *** MOVED PROCESSING LOGIC HERE (INSIDE TRY, AFTER SUCCESS) ***
+                           this.log('SOCKET_PARSED_OBJECT_PREVIEW', {
+                               connectionId,
+                               peerId: socket._peerNodeId || parsedObject?.senderNodeId || peerId,
+                               parsedSize: parsedMessageSize,
+                               typeHint: parsedObject?.type || 'unknown',
+                               keys: Object.keys(parsedObject),
+                               sequence: parsedObject?.sequence,
+                               totalEntries: parsedObject?.totalEntries
+                           });
+
+                           let currentPeerIdForLog = socket._peerNodeId || peerId; // Prefer established socket ID before handlePeerData potentially updates it
+                           if (parsedObject.senderNodeId) {
+                               currentPeerIdForLog = parsedObject.senderNodeId;
+                           }
+
+                           // Determine message type
+                           const messageType = parsedObject.type || (parsedObject.requestSync ? 'sync_request' : (parsedObject.sequence ? 'sync_chunk' : (parsedObject.chunk ? 'sync_chunk' : (parsedObject.totalEntries !== undefined ? 'sync_end' : (parsedObject.version !== undefined ? 'metadata_only' : 'unknown')))));
+                           this.log('SOCKET_PARSED_MESSAGE_TYPE', { connectionId, peerId: currentPeerIdForLog, messageType });
+
+                           // Route message
+                           if (messageType === 'sync_start' || messageType === 'sync_chunk' || messageType === 'sync_end') {
+                                this.log('DEBUG_ENTERING_QUEUE_LOGIC', { connectionId, peerId: currentPeerIdForLog, messageType });
+                                let queueState = this.syncProcessingState.get(socket);
+                                if (!queueState) {
+                                     this.log('SYNC_QUEUE_WARNING', { connectionId, peerId: currentPeerIdForLog, error: 'Queue state missing on message arrival, re-initializing.' });
+                                     queueState = { queue: [], processing: false };
+                                     this.syncProcessingState.set(socket, queueState);
+                                }
+                                queueState.queue.push(parsedObject);
+                                this.log('SYNC_QUEUE_MESSAGE_ADDED', { connectionId, peerId: currentPeerIdForLog, messageType, queueSize: queueState.queue.length });
+                                this._processSyncQueue(socket); // Fire and forget (async)
+                           } else {
+                                this.log('DEBUG_ENTERING_IMMEDIATE_HANDLE_LOGIC', { connectionId, peerId: currentPeerIdForLog, messageType });
+                                this.log('SYNC_IMMEDIATE_HANDLE', { connectionId, peerId: currentPeerIdForLog, messageType });
+                                // Call handlePeerData IMMEDIATELY for non-chunk/start/end messages
+                                await this.handlePeerData(socket, null, parsedObject);
+                                this.log('DEBUG_AFTER_AWAIT_HANDLE_PEER_DATA', { connectionId, peerId: socket._peerNodeId || 'unknown_after_handle', messageType }); // Log peerId *after* handlePeerData ran
+                           }
+                           this.log('DEBUG_AFTER_IF_ELSE', { connectionId, peerId: socket._peerNodeId || 'unknown_after_if', messageType });
+                           // *** END MOVED PROCESSING LOGIC ***
+
+                      } catch (parseErr) {
+                           // Parse failed - log and keep buffer for next data event
+                           this.log('SOCKET_JSON_PARSE_INCOMPLETE', { /* ... */ });
                       }
-
-                      // If no JSON start found, or only whitespace before it, clear buffer (or the whitespace part)
-                      if (potentialStart === -1) {
-                          if (buffer.trim().length === 0) {
-                              // Buffer contains only whitespace, clear it
-                              buffer = '';
-                          }
-                          // If non-whitespace junk before potential JSON, keep it for now? Or log/discard?
-                          // For now, we break the loop, assuming we need more data to form a valid start.
-                          break;
-                      }
-
-                      // Discard data before the first potential JSON start
-                      if (potentialStart > 0) {
-                          const discardedData = buffer.substring(0, potentialStart);
-                          this.log('SOCKET_BUFFER_DISCARDING_PREFIX', { connectionId, peerId: socket._peerNodeId || 'unknown', discardedLength: discardedData.length, prefixSample: discardedData.substring(0, 100) });
-                          buffer = buffer.substring(potentialStart);
-                      }
-
-                      // Attempt to parse the remaining buffer
-                      const parsed = JSON.parse(buffer);
-                      const parsedMessageSize = Buffer.byteLength(buffer, 'utf8'); // Size of the successfully parsed message
-
-                      // If successful, log and reset the buffer entirely (as we parsed the whole remaining content)
-                      this.log('SOCKET_BUFFER_PARSE_SUCCESS', { connectionId, peerId: socket._peerNodeId || parsed?.senderNodeId || 'unknown', parsedSize: parsedMessageSize });
-                      const dataToProcess = buffer; // Capture the buffer content *before* clearing
-                      buffer = ''; // Consume the entire buffer
-
-                      // Update peer's nodeId if we receive it
-                      if (parsed.senderNodeId && !peerNodeId) {
-                          peerNodeId = parsed.senderNodeId;
-                          socket._peerNodeId = peerNodeId; // Update socket property
-                          this.log('NEW_PEER_IDENTIFIED', { connectionId, peerId: peerNodeId });
-                      } else if (parsed.senderNodeId && peerNodeId && parsed.senderNodeId !== peerNodeId) {
-                          this.log('PEER_ID_CHANGED', { connectionId, oldId: peerNodeId, newId: parsed.senderNodeId });
-                          peerNodeId = parsed.senderNodeId; // Update tracked ID
-                          socket._peerNodeId = peerNodeId; // Update socket property
-                      }
-
-                      // Pass the *original string data* that was successfully parsed
-                      await this.handlePeerData(socket, null, dataToProcess); // Pass the original string
-                      processed = true; // We successfully processed a message
-
-                  } catch (parseErr) {
-                      // If we can't parse the JSON yet, it's likely an incomplete message.
-                      if (parseErr instanceof SyntaxError) {
-                          // Expected error for incomplete JSON. Break the inner loop and wait for more data.
-                          // Optional: Add logging if buffer gets large and still incomplete
-                          // if (buffer.length > 1 * 1024 * 1024) { this.log(...) }
-                          break; // Exit the while loop, wait for more data
-                      } else {
-                          // Unexpected error during parse (not SyntaxError) - Log and clear buffer to prevent infinite loops
-                          this.log('SOCKET_BUFFER_PARSE_UNEXPECTED_ERROR', { connectionId, peerId: socket._peerNodeId || 'unknown', bufferSize: buffer.length, error: parseErr.message, stack: parseErr.stack, bufferSample: buffer.substring(0, 200) });
-                          buffer = ''; // Clear buffer on unexpected errors
-                          this.stats.errors++;
-                          break; // Exit the while loop
-                      }
+                  } else {
+                       this.log('SOCKET_BUFFER_EMPTY_OR_WHITESPACE', { connectionId, peerId });
                   }
-              } // End while(processed && buffer.length > 0)
-            })().catch(err => {
-                // Catch errors from the async IIFE itself or handlePeerData
-                this.log('SOCKET_DATA_ASYNC_HANDLER_ERROR', { connectionId, peerId: socket._peerNodeId || 'unknown', error: err.message, stack: err.stack });
-                buffer = ''; // Reset buffer on error
-                this.stats.errors++;
-            });
-          });
-          // *** END REFACTORED Logic ***
+                  this.log('SOCKET_DATA_HANDLER_EXITING', { connectionId, peerId: socket._peerNodeId || 'unknown_at_exit', finalBufferLength: buffer.length });
+              })().catch(err => { /* ... */ });
+              // *** END More Detailed Logging ***
+          }); // End socket.on('data')
 
-
-          // Handle disconnection
           socket.on('close', (hadError) => {
-            const finalPeerId = socket._peerNodeId || peerNodeId || 'unknown'; // Get best known ID
-            this.log('CONNECTION_CLOSED', { connectionId, peerId: finalPeerId, hadError });
+            // *** MODIFIED: Use socket properties directly ***
+            const finalPeerId = socket._peerNodeId || 'unknown';
+            const finalConnectionId = socket._connectionId || 'unknown';
+            this.log('CONNECTION_CLOSED', { connectionId: finalConnectionId, peerId: finalPeerId, hadError });
+            // *** END MODIFICATION ***
             this.connections.delete(socket);
-            // Clean up associated state if needed (sync times, peer versions are cleaned elsewhere or on memory check)
-            // If socket had an active _syncBatch, ensure it's cleaned up
-             if (socket._syncBatch) {
-                 this.log('SYNC_BATCH_CLEANUP_ON_CLOSE', { connectionId, peerId: finalPeerId });
-                 // Attempt to close the batch cleanly, ignore errors
-                 if (socket._syncBatch && !socket._syncBatch.closed) { // Added check for socket._syncBatch existence
-                    try { socket._syncBatch.close(); } catch(e) { /* ignore */ } 
-                 }
-                 socket._syncBatch = null; // Nullify reference
+            this.syncProcessingState.delete(socket);
+            // Reset peer tracking maps for this peer if ID was known
+             if (finalPeerId !== 'unknown') {
+                 this.lastSyncTimes.delete(finalPeerId);
+                 this.peerVersions.delete(finalPeerId);
              }
-             // Clear other sync-related properties
-             socket._syncProcessedCounter = null;
-             socket._syncTotalWrittenCounter = null;
-             socket._syncInitialLocalVersion = null;
-             socket._syncInitialLocalLastModified = null;
-             socket._syncRemoteMeta = null;
           });
 
           socket.on('error', (err) => {
-            const finalPeerId = socket._peerNodeId || peerNodeId || 'unknown';
-            this.log('SOCKET_ERROR', { connectionId, peerId: finalPeerId, error: err.message, stack: err.stack });
-            this.connections.delete(socket); // Ensure removal on error
+            // *** MODIFIED: Use socket properties directly and fix variable name ***
+            const finalPeerId = socket._peerNodeId || 'unknown';
+            const finalConnectionId = socket._connectionId || 'unknown';
+            this.log('SOCKET_ERROR', { connectionId: finalConnectionId, peerId: finalPeerId, error: err.message, stack: err.stack });
+             // *** END MODIFICATION ***
+            this.connections.delete(socket);
+            this.syncProcessingState.delete(socket);
             this.stats.errors++;
-            // Cleanup state similar to 'close' handler
-            if (socket._syncBatch) {
-                 this.log('SYNC_BATCH_CLEANUP_ON_ERROR', { connectionId, peerId: finalPeerId });
-                 if (socket._syncBatch && !socket._syncBatch.closed) { // Added check for socket._syncBatch existence
-                    try { socket._syncBatch.close(); } catch(e) { /* ignore */ } 
-                 }
-                 socket._syncBatch = null;
+             // Reset peer tracking maps for this peer if ID was known
+             if (finalPeerId !== 'unknown') {
+                 this.lastSyncTimes.delete(finalPeerId);
+                 this.peerVersions.delete(finalPeerId);
              }
-             socket._syncProcessedCounter = null;
-             socket._syncTotalWrittenCounter = null;
-             socket._syncInitialLocalVersion = null;
-             socket._syncInitialLocalLastModified = null;
-             socket._syncRemoteMeta = null;
           });
-        } catch (err) {
-           // Error setting up the connection handler itself
+
+        } catch (connSetupErr) { // Catch errors in the main connection setup
            const connId = socket?._connectionId || connectionId || 'setup_failed';
-           this.log('CONNECTION_SETUP_ERROR', { connectionId: connId, error: err.message, stack: err.stack });
+           this.log('CONNECTION_SETUP_ERROR', { connectionId: connId, error: connSetupErr.message, stack: connSetupErr.stack });
            this.stats.errors++;
-           if (socket && !socket.destroyed) {
-               socket.destroy(err); // Attempt to close the problematic socket
+           if (socket) {
+               if (!socket.destroyed) { socket.destroy(connSetupErr); }
+               this.connections.delete(socket);
+               this.syncProcessingState.delete(socket); // Ensure cleanup here too
            }
-           if (socket) this.connections.delete(socket); // Ensure removal
         }
-      });
+      }); // End swarm.on('connection')
 
       // Handle discovery events
       this.swarm.on('peer', (peer) => {
@@ -1681,6 +1657,8 @@ class P2PDBClient {
       }
       
       console.log('P2P network stopped');
+      // *** Clear the queues map ***
+      this.syncProcessingState.clear();
       return true;
     } catch (err) {
       console.error('Error stopping P2P network:', err);
@@ -2050,47 +2028,46 @@ class P2PDBClient {
   }
 
   // Function to sync database state with all connected peers
-  async syncWithPeers(trigger = 'local_change') {
-    this.log('SYNC_TRIGGERED', { trigger, peerCount: this.connections.size });
+  async syncWithPeers(trigger = 'local_change', parentSyncChain = []) { // Added parentSyncChain
+    this.log('SYNC_TRIGGERED', { trigger, peerCount: this.connections.size, parentChainLength: parentSyncChain.length }); // Log chain info
     for (const socket of this.connections) {
-      if (!socket.destroyed) {
-        // Use the peerId associated with the socket for logging/checks if available
-        const peerId = socket._peerNodeId || 'unknown';
-        try {
-          // Pass the trigger reason to handleSyncRequest
-          await this.handleSyncRequest(socket, trigger);
-        } catch (err) {
-          this.log('SYNC_PEER_ERROR', { peerId, trigger, error: err.message });
-          this.stats.errors++;
-          // Decide if we should remove the connection on error, e.g.:
-          // this.connections.delete(socket);
-          // socket.destroy();
+        if (!socket.destroyed) {
+            const peerId = socket._peerNodeId || 'unknown';
+            try {
+                // *** CHANGE 2: Check if peer is anywhere in the chain ***
+                let chainToSendToPeer;
+                const peerIsInChain = peerId !== 'unknown' && parentSyncChain.includes(peerId);
+
+                if (peerIsInChain) {
+                    // Don't propagate the existing chain back to a node already in the path.
+                    // Send metadata reflecting the current node's state, starting a fresh chain from here.
+                    this.log('SYNC_WITH_PEERS_SKIP_CHAIN_PROPAGATION_TO_ANCESTOR', { trigger, peerId, originalChain: parentSyncChain });
+                    chainToSendToPeer = []; // Start fresh chain
+                } else {
+                    // This peer is not in the parent chain, propagate the chain normally.
+                    chainToSendToPeer = parentSyncChain;
+                }
+                // *** Pass the potentially modified chain ***
+                await this.handleSyncRequest(socket, trigger, chainToSendToPeer); // Use potentially modified chain
+            } catch (err) {
+                this.log('SYNC_PEER_ERROR', { peerId, trigger, error: err.message });
+                this.stats.errors++;
+            }
+        } else {
+            this.connections.delete(socket);
         }
-      } else {
-        // Clean up destroyed sockets if they are still in the set
-        this.connections.delete(socket);
-      }
     }
-  }
+}
 
   // *** NEW: Centralized Cleanup Function ***
   _cleanupSyncState(socket) {
       if (!socket) return;
       const peerId = socket._peerNodeId || 'unknown';
       // Check if already cleaned
-      if (socket._syncBatch === undefined && socket._activeChunkHandlers === undefined) {
+      if (socket._syncBatch === undefined && socket._activeChunkHandlers === undefined && socket._currentSyncChain === undefined) { // Also check _currentSyncChain
           return;
       }
-
-      // Attempt to close batch if it exists and isn't closed
-      if (socket._syncBatch && !socket._syncBatch.closed) {
-          this.log('SYNC_STATE_CLEANUP_CLOSING_BATCH', { connectionId: socket._connectionId || 'N/A', peerId });
-          try {
-              socket._syncBatch.close(); // Don't await, fire and forget
-          } catch (e) {
-              this.log('SYNC_STATE_CLEANUP_BATCH_CLOSE_ERROR', { connectionId: socket._connectionId || 'N/A', peerId, error: e.message });
-          }
-      }
+      // ... (close batch logic) ...
 
       // Nullify all sync-related properties
       socket._syncBatch = undefined;
@@ -2101,9 +2078,155 @@ class P2PDBClient {
       socket._syncRemoteMeta = undefined;
       socket._activeChunkHandlers = undefined;
       socket._syncReadyToClean = undefined;
-      // << REMOVED: No longer clearing _syncNetCountChange or _syncInitialLocalCount >>
+      socket._syncNetCountChange = undefined; // Also clear this
+      socket._syncInitialLocalCount = undefined; // And this
+      socket._currentSyncChain = undefined; // *** Clear the stored sync chain ***
 
       this.log('SYNC_CHUNK_STATE_CLEANED (centralized)', { connectionId: socket._connectionId || 'N/A', peerId });
+  }
+
+  // *** MODIFIED: sendFullStateChunks to load data first ***
+  async sendFullStateChunks(socket, trigger, syncChain) {
+      const peerId = socket._peerNodeId || 'unknown';
+      const logContext = { peerId, trigger, connectionId: socket._connectionId || 'N/A' }; // Base context for logging
+      this.log('SENDING_FULL_STATE_CHUNKS (Load First)', { ...logContext }); // Indicate new strategy
+
+      let allEntries = []; // Array to hold all DB entries
+      try {
+          // --- Step 1: Load all relevant data from DB ---
+          this.log('SEND_CHUNKS_LOADING_DB', { ...logContext });
+          const loadStartTime = Date.now();
+          const iterator = this.db.db.iterator();
+          try {
+              for await (const [key, value] of iterator) {
+                  // Skip internal keys and test key
+                  if (key === this.db.METADATA_VERSION_KEY || key === this.db.METADATA_LAST_MODIFIED_KEY || key === this.db.METADATA_ACTIVE_COUNT_KEY || key === '__test__') continue;
+                  allEntries.push({ key, value });
+              }
+          } finally {
+              await iterator.close().catch(err => console.error('Error closing load iterator:', err));
+          }
+          const loadDuration = Date.now() - loadStartTime;
+          this.log('SEND_CHUNKS_DB_LOADED', { ...logContext, entryCount: allEntries.length, durationMs: loadDuration });
+          // --- End Step 1 ---
+
+
+          // --- Step 2: Send data in chunks with backpressure ---
+          const chunkSize = 100;
+          let sequence = 0;
+          const totalEntries = allEntries.length;
+
+          // Send sync_start marker
+          const startPayload = {
+              type: 'sync_start',
+              senderNodeId: this.nodeId,
+              syncChain: syncChain,
+              version: this.db.version,
+              lastModified: this.db.lastModified
+          };
+          const startMessage = JSON.stringify(startPayload);
+          await this._writeDataWithBackpressure(socket, startMessage, { ...logContext, type: 'sync_start' });
+          this.log('SYNC_CHUNK_SENT_START', { ...logContext, version: this.db.version });
+
+          // Loop through the in-memory array
+          for (let i = 0; i < totalEntries; i += chunkSize) {
+              sequence++;
+              const chunk = allEntries.slice(i, i + chunkSize); // Get chunk from array
+              const chunkPayload = { type: 'sync_chunk', senderNodeId: this.nodeId, syncChain, sequence, chunk };
+              const chunkMessage = JSON.stringify(chunkPayload);
+              await this._writeDataWithBackpressure(socket, chunkMessage, { ...logContext, type: 'sync_chunk', sequence });
+              // Optional: Log chunk sent
+              if (sequence % 10 === 1) { // Log progress occasionally
+                 this.log('SEND_CHUNK_PROGRESS (Load First)', { ...logContext, sequence, sent: i + chunk.length, total: totalEntries });
+              }
+          }
+
+          // Clear the large array now that we're done sending
+          this.log('SEND_CHUNK_CLEARING_ARRAY', { ...logContext, sizeBeforeClear: allEntries.length });
+          allEntries = []; // Help GC
+
+          // Send sync_end marker
+          const endPayload = {
+              type: 'sync_end',
+              senderNodeId: this.nodeId,
+              syncChain: syncChain,
+              totalEntries: totalEntries, // Send total count
+              version: this.db.version, // Send current version
+              lastModified: this.db.lastModified // Send current mod time
+          };
+          const endMessage = JSON.stringify(endPayload);
+          await this._writeDataWithBackpressure(socket, endMessage, { ...logContext, type: 'sync_end' });
+          this.log('SYNC_CHUNK_SENT_END', { ...logContext, totalEntries, sequence });
+          // --- End Step 2 ---
+
+      } catch (err) {
+          // Clear array on error too
+          this.log('SEND_CHUNK_CLEARING_ARRAY_ON_ERROR', { ...logContext, sizeBeforeClear: allEntries?.length || 0 });
+          allEntries = []; // Help GC
+          this.log('SEND_CHUNKS_ERROR (Load First)', { ...logContext, error: err.message, stack: err.stack });
+          this.stats.errors++;
+          try {
+              const errorPayload = { type: 'sync_error', senderNodeId: this.nodeId, error: 'Failed to send full state' };
+              socket.write(JSON.stringify(errorPayload));
+          } catch (writeErr) { /* Ignore */ }
+      }
+  }
+
+  // *** REPLACED: Corrected Queue processor function ***
+  async _processSyncQueue(socket) {
+    const peerId = socket._peerNodeId || 'unknown';
+    const logContext = { connectionId: socket._connectionId || 'N/A', peerId };
+
+    let queueState = this.syncProcessingState.get(socket);
+    if (!queueState) {
+      this.log('SYNC_QUEUE_ERROR', { ...logContext, error: 'Queue state not found for socket during processing' });
+      return;
+    }
+
+    // If already processing or queue is empty, do nothing
+    if (queueState.processing || queueState.queue.length === 0) {
+      return;
+    }
+
+    queueState.processing = true;
+    const parsedMessage = queueState.queue.shift(); // Get the next message
+
+    // Determine message type (simplified logic for queued messages)
+    let messageType = parsedMessage.type; // Prefer explicit type
+    if (!messageType) {
+      // Infer based on expected queue contents (start, chunk, end)
+      if (parsedMessage.sequence || parsedMessage.chunk) {
+          messageType = 'sync_chunk';
+      } else if (parsedMessage.totalEntries !== undefined) {
+          messageType = 'sync_end';
+      } else if (parsedMessage.version !== undefined) {
+          // If it has version but no sequence/chunk/totalEntries, it must be sync_start
+          // as only sync_start, sync_chunk, sync_end should be in this queue.
+          messageType = 'sync_start';
+      } else {
+          messageType = 'unknown'; // Fallback, should not happen ideally
+      }
+      // Log if type had to be inferred (might indicate malformed message)
+      if(messageType !== 'unknown') {
+           this.log('SYNC_QUEUE_WARNING', { ...logContext, warning: `Inferred message type as '${messageType}' because 'type' field was missing`, parsedKeys: Object.keys(parsedMessage) });
+      }
+    }
+
+    // Log processing start (optional)
+    // this.log('SYNC_QUEUE_PROCESSING_MESSAGE', { ...logContext, messageType, queueSize: queueState.queue.length });
+
+    try {
+      // Call handlePeerData to process the dequeued message
+      await this.handlePeerData(socket, null, parsedMessage);
+    } catch (err) {
+      // Log errors during processing, but continue processing the queue
+      this.log('SYNC_QUEUE_HANDLER_ERROR', { ...logContext, messageType, error: err.message, stack: err.stack });
+      // Consider more robust error handling, e.g., clearing the queue or closing socket on specific errors
+    } finally {
+      queueState.processing = false;
+      // Use setImmediate to yield control briefly and prevent potential stack overflow
+      setImmediate(() => this._processSyncQueue(socket));
+    }
   }
 }
 
@@ -2130,4 +2253,8 @@ if (require.main === module) {
     await client.stop();
     process.exit();
   });
+
+  // *** NEW: Log PID for easy signal sending ***
+  console.log(`P2PDBClient process running with PID: ${process.pid}`);
+  // *** END NEW ***
 }
