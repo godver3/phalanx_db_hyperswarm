@@ -1,0 +1,76 @@
+name: Create Release and Tag
+
+on:
+  push:
+    branches:
+      - main # Or your default branch, like 'master'
+    paths:
+      - 'version.txt' # Only trigger if version.txt changes
+
+jobs:
+  tag_and_release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed to create releases and push tags
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      # Fetch all history and tags to ensure we know about existing tags
+      with:
+        fetch-depth: 0
+
+    - name: Read version from file
+      id: version
+      run: echo "tag=$(cat version.txt)" >> $GITHUB_OUTPUT
+
+    - name: Construct Tag Name
+      id: tag_name
+      run: echo "value=v${{ steps.version.outputs.tag }}" >> $GITHUB_OUTPUT
+
+    - name: Check if tag exists
+      id: check_tag
+      run: |
+        TAG_EXISTS=$(git tag -l "${{ steps.tag_name.outputs.value }}")
+        if [ -n "$TAG_EXISTS" ]; then
+          echo "Tag ${{ steps.tag_name.outputs.value }} already exists. Skipping tag creation and release."
+          # Optionally, make the job fail or just skip subsequent steps
+          # exit 1 # Uncomment to fail the workflow if tag exists
+          echo "skip=true" >> $GITHUB_OUTPUT # Set output to skip next steps
+        else
+          echo "Tag ${{ steps.tag_name.outputs.value }} does not exist. Proceeding..."
+          echo "skip=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Configure Git User
+      if: steps.check_tag.outputs.skip == 'false'
+      run: |
+        git config --global user.name "${{ github.actor }}"
+        git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+
+    - name: Create and Push Tag
+      if: steps.check_tag.outputs.skip == 'false'
+      run: |
+        echo "Creating tag ${{ steps.tag_name.outputs.value }}"
+        git tag ${{ steps.tag_name.outputs.value }}
+        echo "Pushing tag ${{ steps.tag_name.outputs.value }}"
+        git push origin ${{ steps.tag_name.outputs.value }}
+
+    - name: Create Release
+      if: steps.check_tag.outputs.skip == 'false'
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag_name.outputs.value }} # Use the tag we just created/verified
+        release_name: Release ${{ steps.tag_name.outputs.value }} # e.g., Release v0.50
+        body: |
+          Release automatically created from commit ${{ github.sha }} upon version update.
+          Version: ${{ steps.version.outputs.tag }}
+        draft: false
+        prerelease: false
+
+    - name: Output Release URL
+      if: steps.check_tag.outputs.skip == 'false' && steps.create_release.outputs.html_url
+      run: echo "Created release at ${{ steps.create_release.outputs.html_url }}" 
