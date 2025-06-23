@@ -1,20 +1,25 @@
 {
-  "name": "phalanx-db",
-  "version": "1.0.0",
-  "description": "P2P distributed database built with Hyperswarm",
-  "main": "phalanx_db_rest.js",
+  "name": "phalanx-db-v2",
+  "version": "2.0.0",
+  "description": "P2P distributed database built with Hyperswarm and Hyperbee",
+  "main": "phalanx_db_rest_v2.js",
+  "type": "module",
   "scripts": {
-    "start": "node phalanx_db_rest.js",
-    "dev": "DEBUG=true node phalanx_db_rest.js"
+    "start": "node phalanx_db_rest_v2.js",
+    "start:debug": "node phalanx_db_rest_v2.js --debug",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "dotenv": "16.4.7",
-    "express": "4.21.2",
-    "hyperswarm": "4.11.1",
-    "level": "9.0.0"
+    "classic-level": "^3.0.0",
+    "corestore": "^7.4.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "hyperbee": "^2.24.2",
+    "hyperswarm": "^4.11.7",
+    "level": "^10.0.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "repository": {
     "type": "git",
@@ -24,6 +29,7 @@
     "p2p",
     "database",
     "hyperswarm",
+    "hyperbee",
     "distributed"
   ],
   "author": "",
