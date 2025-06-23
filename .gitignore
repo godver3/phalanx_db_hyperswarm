@@ -40,3 +40,4 @@ phalanx-node-id.json
 hyperbee_storage_v2
 autobase_storage*
 db_data*
+*.json

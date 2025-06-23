@@ -27,7 +27,7 @@ class PhalanxDBRestServerV4 {
   }
 
   setupMiddleware() {
-    this.app.use(express.json({ limit: '50mb' }));
+    this.app.use(express.json({ limit: '500mb' }));
     
     this.app.use((req, res, next) => {
       res.header('Access-Control-Allow-Origin', '*');
@@ -104,6 +104,9 @@ class PhalanxDBRestServerV4 {
     this.app.post('/api/entries', async (req, res) => {
       try {
         if (req.body.data && Array.isArray(req.body.data)) {
+          const entries = [];
+          
+          // Convert to flat structure for bulk import
           for (const item of req.body.data) {
             const infohash = item.infohash;
             for (const [service, serviceData] of Object.entries(item.services)) {
@@ -113,10 +116,28 @@ class PhalanxDBRestServerV4 {
                 last_modified: new Date().toISOString(),
                 expiry: serviceData.expiry,
               };
-              await this.p2pClient.put(key, value);
+              entries.push({ key, value });
             }
           }
-          res.status(201).json({ success: true, message: 'Entries created' });
+          
+          // Use bulk import for large datasets
+          if (entries.length > 50) {
+            console.log(`Using bulk import for ${entries.length} entries...`);
+            await this.p2pClient.bulkImport(entries);
+            res.status(201).json({ 
+              success: true, 
+              message: `Bulk imported ${entries.length} entries` 
+            });
+          } else {
+            // Use regular puts for small datasets
+            for (const { key, value } of entries) {
+              await this.p2pClient.put(key, value);
+            }
+            res.status(201).json({ 
+              success: true, 
+              message: `Created ${entries.length} entries` 
+            });
+          }
         } else {
           res.status(400).json({
             error: 'Invalid request format. Please provide a structured format with data array.'
@@ -200,6 +221,8 @@ class PhalanxDBRestServerV4 {
           peers
         };
         
+        delete response.viewStats;
+
         res.json(response);
       } catch (err) {
         res.status(500).json({ error: err.message });
