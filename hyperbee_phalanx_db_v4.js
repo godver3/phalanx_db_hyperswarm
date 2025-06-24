@@ -35,6 +35,7 @@ class P2PDBClient {
     this.rpc = null;
     this.rpcServer = null;
     this.isUpdating = false;
+    this.lastSync = null; // To cache the last sync timestamp
     
     // Batching configuration
     this.pendingOps = [];
@@ -184,15 +185,31 @@ class P2PDBClient {
             if (data.type === 'batch' && Array.isArray(data.ops)) {
               // Process batched operations
               for (const op of data.ops) {
-                if (op.type === 'put' || op.type === 'del') {
-                  await batch[op.type](op.key, op.value);
+                if (op.type === 'put') {
+                  if (op.value && op.value.last_modified) {
+                      if (!this.lastSync || new Date(op.value.last_modified) > new Date(this.lastSync)) {
+                          this.lastSync = op.value.last_modified;
+                      }
+                  }
+                  await batch.put(op.key, op.value);
+                  opsInBatch++;
+                } else if (op.type === 'del') {
+                  await batch.del(op.key);
                   opsInBatch++;
                 }
               }
-            } else if (data.type === 'put' || data.type === 'del') {
+            } else if (data.type === 'put') {
               // Process single operation (backward compatibility)
-              await batch[data.type](data.key, data.value);
+              if (data.value && data.value.last_modified) {
+                if (!this.lastSync || new Date(data.value.last_modified) > new Date(this.lastSync)) {
+                    this.lastSync = data.value.last_modified;
+                }
+              }
+              await batch.put(data.key, data.value);
               opsInBatch++;
+            } else if (data.type === 'del') {
+                await batch.del(data.key);
+                opsInBatch++;
             }
           } catch (err) {
             console.error('Error processing block, skipping:', err);
@@ -316,6 +333,26 @@ class P2PDBClient {
     console.log('Bulk import complete');
   }
 
+  async getLatestSync() {
+    if (this.lastSync) {
+      return this.lastSync;
+    }
+
+    // If not cached, find it by scanning the view. This can be slow.
+    console.log('Last sync timestamp not cached, scanning view to find it...');
+    let mostRecent = null;
+    for await (const { value } of this.view.createReadStream()) {
+        if (value && value.last_modified) {
+            if (!mostRecent || (new Date(value.last_modified) > new Date(mostRecent))) {
+                mostRecent = value.last_modified;
+            }
+        }
+    }
+    this.lastSync = mostRecent;
+    console.log(`Discovered last sync timestamp: ${this.lastSync}`);
+    return this.lastSync;
+  }
+
   async getStats() {
     const writerStats = {};
     for (const writerKey of this.knownWriters) {
@@ -329,6 +366,7 @@ class P2PDBClient {
     }
 
     const databaseEntries = Object.values(writerStats).reduce((sum, stats) => sum + stats.coreLength, 0);
+    const lastSync = await this.getLatestSync();
 
     return {
       nodeId: this.writer.key.toString('hex'),
@@ -337,6 +375,7 @@ class P2PDBClient {
       peersFound: this.swarm.peers.size,
       knownWriters: this.knownWriters.size,
       databaseEntries,
+      lastSync,
       writerStats,
       memory: process.memoryUsage()
     };
