@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM node:22
 
 WORKDIR /app
 
@@ -9,8 +9,7 @@ COPY package*.json ./
 RUN npm install
 
 # Copy source files
-COPY phalanx_db.js ./
-COPY phalanx_db_rest.js ./
+COPY *.js ./
 
 # Create storage directories
 RUN mkdir -p /app/p2p-db-storage /app/db_data
@@ -25,4 +24,4 @@ VOLUME ["/app/p2p-db-storage", "/app/db_data"]
 COPY .env* ./
 
 # Start the server
-CMD ["node", "phalanx_db_rest.js"] 
+CMD ["npm", "run", "start:v4"] 

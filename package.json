@@ -13,16 +13,12 @@
   },
   "dependencies": {
     "@hyperswarm/rpc": "^3.3.2",
-    "@nxtedition/rocksdb": "^13.5.8",
     "autobase": "^7.13.2",
-    "classic-level": "^3.0.0",
     "corestore": "^7.4.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "hyperbee": "^2.24.2",
-    "hyperswarm": "^4.11.7",
-    "level": "^10.0.0",
-    "rocksdb-native": "^3.6.4"
+    "hyperswarm": "^4.11.7"
   },
   "engines": {
     "node": ">=22"
