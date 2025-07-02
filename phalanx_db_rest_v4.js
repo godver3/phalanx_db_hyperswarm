@@ -201,19 +201,9 @@ class PhalanxDBRestServerV4 {
           }
         }
 
-        const toMB = (bytes) => (bytes / 1024 / 1024).toFixed(2);
-        
-        const formattedMemory = {
-          rss: toMB(stats.memory.rss) + ' MB',
-          heapTotal: toMB(stats.memory.heapTotal) + ' MB',
-          heapUsed: toMB(stats.memory.heapUsed) + ' MB',
-          external: toMB(stats.memory.external) + ' MB',
-          arrayBuffers: toMB(stats.memory.arrayBuffers) + ' MB',
-        };
-
+        // Memory values are already formatted by P2PDBClient.getStats()
         const response = {
           ...stats,
-          memory: formattedMemory,
           v4Features: {
             architecture: 'Multi-writer Hypercore logs with Hyperbee view',
             discovery: 'Hyperswarm RPC'

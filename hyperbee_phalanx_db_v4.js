@@ -14,6 +14,19 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 class P2PDBClient {
+  /**
+   * @param {Object} options - Configuration options
+   * @param {string} options.storageDir - Directory for storing data
+   * @param {string} options.topic - Topic string for P2P network
+   * @param {number} options.batchSize - Number of operations to batch before writing (default: 100)
+   * @param {number} options.batchTimeout - Time in ms to wait before flushing batch (default: 100)
+   * @param {boolean} options.memoryOptimized - Enable memory optimization (default: true)
+   * @param {number} options.maxBatchFlushSize - Max operations in view update batch (default: 5000 if optimized, 50000 if not)
+   * @param {number} options.downloadParallel - Parallel download streams (default: 4 if optimized, 32 if not)
+   * @param {number} options.downloadBlocks - Blocks per download chunk (default: 128 if optimized, 1024 if not)
+   * @param {number} options.streamHighWaterMark - Stream buffer size (default: 16 if optimized, 64 if not)
+   * @param {boolean} options.disablePreFetch - Disable pre-fetching of blocks (default: true if optimized)
+   */
   constructor(options = {}) {
     this.storageDir = options.storageDir || path.join(__dirname, 'autobase_storage_v4');
     this.topicString = options.topic || 'hyperbee-phalanx-db-v4';
@@ -37,11 +50,19 @@ class P2PDBClient {
     this.isUpdating = false;
     this.lastSync = null; // To cache the last sync timestamp
     
-    // Batching configuration
+    // Batching configuration - optimized for memory efficiency
     this.pendingOps = [];
     this.batchSize = options.batchSize || 100; // Group 100 operations per block
     this.batchTimeout = options.batchTimeout || 100; // Flush after 100ms
     this.batchTimer = null;
+    
+    // Memory optimization settings
+    this.memoryOptimized = options.memoryOptimized !== false; // Default to true
+    this.maxBatchFlushSize = options.maxBatchFlushSize || (this.memoryOptimized ? 5000 : 50000);
+    this.downloadParallel = options.downloadParallel || (this.memoryOptimized ? 4 : 32);
+    this.downloadBlocks = options.downloadBlocks || (this.memoryOptimized ? 128 : 1024);
+    this.streamHighWaterMark = options.streamHighWaterMark || (this.memoryOptimized ? 16 : 64);
+    this.disablePreFetch = options.disablePreFetch || this.memoryOptimized;
   }
 
   _debug(...args) {
@@ -137,6 +158,10 @@ class P2PDBClient {
     try {
       for (const writerKeyHex of this.knownWriters) {
         const writerStartTime = Date.now();
+        const memUsage = process.memoryUsage();
+        const initialMemory = (typeof memUsage.heapUsed === 'number' && !isNaN(memUsage.heapUsed)) 
+          ? memUsage.heapUsed / 1024 / 1024 
+          : 0;
         const core = this.store.get(Buffer.from(writerKeyHex, 'hex'));
         await core.ready();
 
@@ -146,35 +171,48 @@ class P2PDBClient {
           continue;
         }
 
-        this._debug(`[_updateView] Indexing writer ${writerKeyHex.slice(-6)} from ${startIndex} to ${core.length}. Total new ops: ${core.length - startIndex}`);
+        const opsCount = core.length - startIndex;
+        const memoryDisplay = initialMemory > 0 ? ` Memory: ${Math.round(initialMemory)}MB` : '';
+        this._debug(`[_updateView] Indexing writer ${writerKeyHex.slice(-6)} from ${startIndex} to ${core.length}. Total new ops: ${opsCount}.${memoryDisplay}`);
         
-        this._debug(`[_updateView] Pre-fetching ${core.length - startIndex} blocks for writer ${writerKeyHex.slice(-6)}...`);
-        const downloadStartTime = Date.now();
-        const range = { start: startIndex, end: core.length };
+        if (opsCount > 10000) {
+          console.log(`Processing large batch: ${opsCount} operations for writer ${writerKeyHex.slice(-6)}.${memoryDisplay}`);
+        }
         
-        // Optimize download with parallel fetching
-        const downloadOptions = {
-          linear: false, // Allow non-linear downloading
-          blocks: 1024,    // Download in chunks of 64 blocks
-          parallel: 32    // Use 4 parallel download streams
-        };
-        
-        await core.download(range, downloadOptions).done();
-        const downloadTime = Date.now() - downloadStartTime;
-        this._debug(`[_updateView] Pre-fetching complete in ${downloadTime}ms.`);
-
+        let downloadTime = 0;
         const processStartTime = Date.now();
+        
+        // Conditional pre-fetching based on memory optimization settings
+        if (!this.disablePreFetch) {
+          this._debug(`[_updateView] Pre-fetching ${core.length - startIndex} blocks for writer ${writerKeyHex.slice(-6)}...`);
+          const downloadStartTime = Date.now();
+          const range = { start: startIndex, end: core.length };
+          
+          // Use memory-optimized download settings
+          const downloadOptions = {
+            linear: false,
+            blocks: this.downloadBlocks,
+            parallel: this.downloadParallel
+          };
+          
+          await core.download(range, downloadOptions).done();
+          downloadTime = Date.now() - downloadStartTime;
+          this._debug(`[_updateView] Pre-fetching complete in ${downloadTime}ms.`);
+        } else {
+          this._debug(`[_updateView] Skipping pre-fetch for memory optimization, processing ${core.length - startIndex} blocks for writer ${writerKeyHex.slice(-6)}...`);
+        }
+
         const stream = core.createReadStream({ 
           start: startIndex, 
           end: core.length,
-          highWaterMark: 64 // Read 64 blocks at a time into memory
+          highWaterMark: this.streamHighWaterMark
         });
         let batch = this.view.batch();
         let blocksProcessed = 0;
         let opsInBatch = 0;
         let loopStartTime = Date.now();
         const LOG_INTERVAL = 10000; // Increased from 1000 to reduce logging overhead
-        const BATCH_FLUSH_SIZE = 50000; // Increased from 10000 for better throughput
+        const BATCH_FLUSH_SIZE = this.maxBatchFlushSize;
 
         for await (const block of stream) {
           blocksProcessed++;
@@ -255,8 +293,17 @@ class P2PDBClient {
         
         const processTime = Date.now() - processStartTime;
         const totalTime = Date.now() - writerStartTime;
+        const finalMemUsage = process.memoryUsage();
+        const finalMemory = (typeof finalMemUsage.heapUsed === 'number' && !isNaN(finalMemUsage.heapUsed)) 
+          ? finalMemUsage.heapUsed / 1024 / 1024 
+          : 0;
+        const memoryDelta = initialMemory > 0 && finalMemory > 0 ? Math.round(finalMemory - initialMemory) : 0;
         
-        console.log(`Indexed writer ${writerKeyHex.slice(-6)} up to ${finalIndex}`);
+        if (finalMemory > 0) {
+          console.log(`Indexed writer ${writerKeyHex.slice(-6)} up to ${finalIndex}. Memory: ${Math.round(finalMemory)}MB (${memoryDelta >= 0 ? '+' : ''}${memoryDelta}MB)`);
+        } else {
+          console.log(`Indexed writer ${writerKeyHex.slice(-6)} up to ${finalIndex}`);
+        }
         this._debug(`[_updateView] Writer ${writerKeyHex.slice(-6)} timing: download=${downloadTime}ms, process=${processTime}ms, total=${totalTime}ms`);
       }
     } catch (err) {
@@ -309,8 +356,8 @@ class P2PDBClient {
   async bulkImport(entries) {
     console.log(`Starting bulk import of ${entries.length} entries...`);
     
-    // Use much larger batches for bulk import
-    const BULK_BATCH_SIZE = 1000;
+    // Use memory-optimized batch size for bulk import
+    const BULK_BATCH_SIZE = this.memoryOptimized ? 500 : 1000;
     
     for (let i = 0; i < entries.length; i += BULK_BATCH_SIZE) {
       const batch = entries.slice(i, i + BULK_BATCH_SIZE);
@@ -367,6 +414,13 @@ class P2PDBClient {
 
     const databaseEntries = Object.values(writerStats).reduce((sum, stats) => sum + stats.coreLength, 0);
     const lastSync = await this.getLatestSync();
+    const memoryUsage = process.memoryUsage();
+
+    // Helper function to safely convert bytes to MB
+    const bytesToMB = (bytes) => {
+      if (typeof bytes !== 'number' || isNaN(bytes)) return '0 MB';
+      return Math.round(bytes / 1024 / 1024) + ' MB';
+    };
 
     return {
       nodeId: this.writer.key.toString('hex'),
@@ -377,7 +431,21 @@ class P2PDBClient {
       databaseEntries,
       lastSync,
       writerStats,
-      memory: process.memoryUsage()
+      memory: {
+        rss: bytesToMB(memoryUsage.rss),
+        heapTotal: bytesToMB(memoryUsage.heapTotal),
+        heapUsed: bytesToMB(memoryUsage.heapUsed),
+        external: bytesToMB(memoryUsage.external),
+        arrayBuffers: bytesToMB(memoryUsage.arrayBuffers)
+      },
+      config: {
+        memoryOptimized: this.memoryOptimized,
+        maxBatchFlushSize: this.maxBatchFlushSize,
+        downloadParallel: this.downloadParallel,
+        downloadBlocks: this.downloadBlocks,
+        streamHighWaterMark: this.streamHighWaterMark,
+        disablePreFetch: this.disablePreFetch
+      }
     };
   }
 
@@ -387,6 +455,51 @@ class P2PDBClient {
     
     if (this.rpcServer) await this.rpcServer.close();
     await this.swarm.destroy();
+  }
+
+  // Force garbage collection if available (useful after large operations)
+  forceGC() {
+    if (global.gc) {
+      console.log('Forcing garbage collection...');
+      global.gc();
+      return true;
+    } else {
+      console.log('Garbage collection not available. Start Node.js with --expose-gc flag to enable.');
+      return false;
+    }
+  }
+
+  // Get memory optimization recommendations based on current usage
+  getMemoryRecommendations() {
+    const memoryUsage = process.memoryUsage();
+    const heapUsedMB = (typeof memoryUsage.heapUsed === 'number' && !isNaN(memoryUsage.heapUsed)) 
+      ? memoryUsage.heapUsed / 1024 / 1024 
+      : 0;
+    const recommendations = [];
+
+    if (heapUsedMB > 500 && !this.memoryOptimized) {
+      recommendations.push('Enable memory optimization: new P2PDBClient({ memoryOptimized: true })');
+    }
+
+    if (heapUsedMB > 1000) {
+      recommendations.push('Consider reducing maxBatchFlushSize to 1000-2000');
+      recommendations.push('Consider reducing downloadParallel to 2-4');
+      recommendations.push('Consider enabling disablePreFetch: true');
+    }
+
+    if (this.knownWriters.size > 10) {
+      recommendations.push('Large number of writers detected - memory usage scales with writer count');
+    }
+
+    if (recommendations.length === 0) {
+      recommendations.push('Memory usage looks optimal');
+    }
+
+    return {
+      currentHeapUsage: heapUsedMB > 0 ? Math.round(heapUsedMB) + ' MB' : 'Unknown',
+      memoryOptimized: this.memoryOptimized,
+      recommendations
+    };
   }
 }
 

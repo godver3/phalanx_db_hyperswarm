@@ -41,3 +41,12 @@ hyperbee_storage_v2
 autobase_storage*
 db_data*
 *.json
+test_storage/CORESTORE
+test_storage/db/CURRENT
+test_storage/db/IDENTITY
+test_storage/db/LOCK
+test_storage/db/LOG
+test_storage/db/MANIFEST-000005
+test_storage/db/OPTIONS-000007
+test_memory_fix.js
+memory_usage_example.js
