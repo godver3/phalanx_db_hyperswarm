@@ -1,6 +1,16 @@
 #!/usr/bin/env node
 'use strict';
 
+//
+// Phalanx DB REST Server V4
+//
+// Features:
+// - Multi-writer Hypercore logs with Hyperbee view
+// - Accurate entry counting: Starts with full count, tracks incremental changes
+// - Memory-optimized batching and indexing
+// - Hyperswarm discovery and replication
+//
+
 import dotenv from 'dotenv';
 import express from 'express';
 import { P2PDBClient } from './hyperbee_phalanx_db_v4.js';
@@ -47,20 +57,34 @@ class PhalanxDBRestServerV4 {
 
   setupRoutes() {
     this.app.get('/health', async (req, res) => {
-      res.json({
-        status: 'healthy',
-        version: 'v4',
-        localWriterKey: this.p2pClient.writer.key.toString('hex'),
-        view: {
-          version: this.p2pClient.view.version,
-          byteLength: this.p2pClient.view.byteLength
-        },
-        knownWriters: Array.from(this.p2pClient.knownWriters),
-        swarm: {
-            peers: this.p2pClient.swarm.peers.size,
-            topic: this.p2pClient.topicString
-        }
-      });
+      try {
+        const stats = await this.p2pClient.getStats();
+        res.json({
+          status: 'healthy',
+          version: 'v4',
+          localWriterKey: this.p2pClient.writer.key.toString('hex'),
+          database: {
+            entries: stats.databaseEntries,
+            countInitialized: this.p2pClient.countInitialized,
+            lastSync: stats.lastSync
+          },
+          view: {
+            version: this.p2pClient.view.version,
+            byteLength: this.p2pClient.view.byteLength
+          },
+          knownWriters: Array.from(this.p2pClient.knownWriters),
+          swarm: {
+              peers: this.p2pClient.swarm.peers.size,
+              topic: this.p2pClient.topicString
+          }
+        });
+      } catch (err) {
+        res.status(500).json({ 
+          status: 'error',
+          error: err.message,
+          version: 'v4'
+        });
+      }
     });
 
     // Get all entries
@@ -206,7 +230,13 @@ class PhalanxDBRestServerV4 {
           ...stats,
           v4Features: {
             architecture: 'Multi-writer Hypercore logs with Hyperbee view',
-            discovery: 'Hyperswarm RPC'
+            discovery: 'Hyperswarm RPC',
+            accurateEntryCount: true
+          },
+          entryCount: {
+            current: stats.databaseEntries,
+            initialized: this.p2pClient.countInitialized,
+            accurate: this.p2pClient.countInitialized
           },
           peers
         };
@@ -214,6 +244,29 @@ class PhalanxDBRestServerV4 {
         delete response.viewStats;
 
         res.json(response);
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // Get entry count and related statistics
+    this.app.get('/api/stats/entries', async (req, res) => {
+      try {
+        const stats = await this.p2pClient.getStats();
+        
+        res.json({
+          entries: {
+            count: stats.databaseEntries,
+            countInitialized: this.p2pClient.countInitialized,
+            accurateCount: this.p2pClient.countInitialized
+          },
+          lastSync: stats.lastSync,
+          writers: {
+            total: stats.knownWriters,
+            details: stats.writerStats
+          },
+          timestamp: new Date().toISOString()
+        });
       } catch (err) {
         res.status(500).json({ error: err.message });
       }

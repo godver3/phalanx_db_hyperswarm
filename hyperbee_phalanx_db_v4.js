@@ -49,6 +49,8 @@ class P2PDBClient {
     this.rpcServer = null;
     this.isUpdating = false;
     this.lastSync = null; // To cache the last sync timestamp
+    this.activeEntriesCount = 0; // Track accurate entry count
+    this.countInitialized = false; // Flag to track if initial count is done
     
     // Batching configuration - optimized for memory efficiency
     this.pendingOps = [];
@@ -125,6 +127,10 @@ class P2PDBClient {
     await this.swarm.flush();
 
     console.log('P2P Client (V4) started. Topic:', this.topicString);
+    
+    // Calculate initial entry count
+    await this._calculateInitialCount();
+    
     // Periodically update the view from all known writers
     setInterval(() => this._updateView(), 5000);
     this._updateView(); // Initial view update
@@ -213,6 +219,9 @@ class P2PDBClient {
         let loopStartTime = Date.now();
         const LOG_INTERVAL = 10000; // Increased from 1000 to reduce logging overhead
         const BATCH_FLUSH_SIZE = this.maxBatchFlushSize;
+        
+        // Track entry count changes during this update
+        let entryCountDelta = 0;
 
         for await (const block of stream) {
           blocksProcessed++;
@@ -229,9 +238,27 @@ class P2PDBClient {
                           this.lastSync = op.value.last_modified;
                       }
                   }
+                  
+                  // Track entry count changes for PUT operations
+                  if (this.countInitialized) {
+                    const existingEntry = await this.view.get(op.key);
+                    if (!existingEntry || !existingEntry.value) {
+                      entryCountDelta++; // New entry
+                    }
+                    // If entry exists, it's an update - no count change
+                  }
+                  
                   await batch.put(op.key, op.value);
                   opsInBatch++;
                 } else if (op.type === 'del') {
+                  // Track entry count changes for DELETE operations
+                  if (this.countInitialized) {
+                    const existingEntry = await this.view.get(op.key);
+                    if (existingEntry && existingEntry.value) {
+                      entryCountDelta--; // Deleted existing entry
+                    }
+                  }
+                  
                   await batch.del(op.key);
                   opsInBatch++;
                 }
@@ -243,9 +270,26 @@ class P2PDBClient {
                     this.lastSync = data.value.last_modified;
                 }
               }
+              
+              // Track entry count changes for single PUT operations
+              if (this.countInitialized) {
+                const existingEntry = await this.view.get(data.key);
+                if (!existingEntry || !existingEntry.value) {
+                  entryCountDelta++; // New entry
+                }
+              }
+              
               await batch.put(data.key, data.value);
               opsInBatch++;
             } else if (data.type === 'del') {
+                // Track entry count changes for single DELETE operations  
+                if (this.countInitialized) {
+                  const existingEntry = await this.view.get(data.key);
+                  if (existingEntry && existingEntry.value) {
+                    entryCountDelta--; // Deleted existing entry
+                  }
+                }
+                
                 await batch.del(data.key);
                 opsInBatch++;
             }
@@ -290,6 +334,12 @@ class P2PDBClient {
         const finalIndex = core.length;
         this.indexing.set(writerKeyHex, finalIndex);
         await this.indexingBee.put(writerKeyHex, finalIndex);
+        
+        // Apply entry count changes
+        if (this.countInitialized && entryCountDelta !== 0) {
+          this.activeEntriesCount += entryCountDelta;
+          this._debug(`[_updateView] Entry count delta: ${entryCountDelta >= 0 ? '+' : ''}${entryCountDelta}, new total: ${this.activeEntriesCount}`);
+        }
         
         const processTime = Date.now() - processStartTime;
         const totalTime = Date.now() - writerStartTime;
@@ -412,7 +462,8 @@ class P2PDBClient {
       };
     }
 
-    const databaseEntries = Object.values(writerStats).reduce((sum, stats) => sum + stats.coreLength, 0);
+    // Use accurate entry count instead of sum of core lengths
+    const databaseEntries = this.countInitialized ? this.activeEntriesCount : 'Calculating...';
     const lastSync = await this.getLatestSync();
     const memoryUsage = process.memoryUsage();
 
@@ -500,6 +551,29 @@ class P2PDBClient {
       memoryOptimized: this.memoryOptimized,
       recommendations
     };
+  }
+
+  async _calculateInitialCount() {
+    console.log('Calculating initial database entry count...');
+    let count = 0;
+    
+    try {
+      for await (const { key, value } of this.view.createReadStream()) {
+        if (value) { // Only count non-null entries
+          count++;
+        }
+      }
+      
+      this.activeEntriesCount = count;
+      this.countInitialized = true;
+      console.log(`Initial database entry count: ${count}`);
+      return count;
+    } catch (err) {
+      console.error('Error calculating initial count:', err);
+      this.activeEntriesCount = 0;
+      this.countInitialized = true;
+      return 0;
+    }
   }
 }
 
