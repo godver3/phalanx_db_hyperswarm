@@ -188,63 +188,46 @@ class P2PDBClient {
     await this.rpcServer.listen();
     console.log('RPC Server listening for writer key requests.');
 
-    this.swarm.on('connection', async (socket, peerInfo) => {
+        this.swarm.on('connection', async (socket, peerInfo) => {
       const peerId = peerInfo.publicKey.toString('hex');
       const peerShortId = peerId.slice(-6);
       
       console.log(`Peer ${peerShortId} connected, replicating...`);
       this.store.replicate(socket);
-      
+
       // Track this connection
       this.activeConnections.set(peerId, {
         socket,
         peerInfo,
-        connectedAt: Date.now(),
-        rpcAttempted: false
+        connectedAt: Date.now()
       });
 
-      // Wait a bit to see if the connection is stable before making RPC request
-      setTimeout(async () => {
-        const connection = this.activeConnections.get(peerId);
-        if (!connection) return; // Connection was already cleaned up
+      // Make RPC request immediately (critical for peer discovery)
+      try {
+        console.log(`Requesting writer key from peer ${peerShortId}`);
         
-        // Check if socket is still active
-        if (connection.socket && connection.socket.destroyed) {
-          console.log(`Peer ${peerShortId} disconnected before RPC attempt`);
-          return;
-        }
+        // Track the pending request
+        const requestPromise = this.rpc.request(peerInfo.publicKey, 'get_writer_key', null, { timeout: 10000 });
+        this.pendingRpcRequests.set(peerId, requestPromise);
         
-        // Only make RPC request if we haven't already tried
-        if (connection.rpcAttempted) return;
-        connection.rpcAttempted = true;
+        const keyBuffer = await requestPromise;
+        const newKey = keyBuffer.toString('utf-8');
 
-        // Make RPC request with proper cleanup
-        try {
-          console.log(`Requesting writer key from peer ${peerShortId}`);
-          
-          // Track the pending request
-          const requestPromise = this.rpc.request(peerInfo.publicKey, 'get_writer_key', null, { timeout: 5000 });
-          this.pendingRpcRequests.set(peerId, requestPromise);
-          
-          const keyBuffer = await requestPromise;
-          const newKey = keyBuffer.toString('utf-8');
-
-          if (!this.knownWriters.has(newKey)) {
-            this.knownWriters.add(newKey);
-            console.log('Discovered new writer via RPC:', newKey);
-            this._updateView();
-          }
-        } catch (err) {
-          if (err.message.includes('CHANNEL_CLOSED')) {
-            console.log(`RPC channel closed for peer ${peerShortId} (likely disconnected)`);
-          } else {
-            console.error(`RPC request to peer ${peerShortId} failed:`, err.message);
-          }
-        } finally {
-          // Clean up the pending request
-          this.pendingRpcRequests.delete(peerId);
+        if (!this.knownWriters.has(newKey)) {
+          this.knownWriters.add(newKey);
+          console.log('Discovered new writer via RPC:', newKey);
+          this._updateView();
         }
-      }, 2000); // Wait 2 seconds before attempting RPC
+      } catch (err) {
+        if (err.message.includes('CHANNEL_CLOSED')) {
+          console.log(`RPC channel closed for peer ${peerShortId} (likely disconnected)`);
+        } else {
+          console.error(`RPC request to peer ${peerShortId} failed:`, err.message);
+        }
+      } finally {
+        // Clean up the pending request
+        this.pendingRpcRequests.delete(peerId);
+      }
     });
 
     // Handle peer disconnections
