@@ -49,8 +49,15 @@ class P2PDBClient {
     this.rpcServer = null;
     this.isUpdating = false;
     this.lastSync = null; // To cache the last sync timestamp
+    this.lastSyncUpdate = null; // Track when last sync was updated
     this.activeEntriesCount = 0; // Track accurate entry count
     this.countInitialized = false; // Flag to track if initial count is done
+    this.countCalculationPromise = null; // Track ongoing count calculation
+    this.lastCountUpdate = null; // Track when count was last updated
+    
+    // Connection tracking for proper cleanup
+    this.activeConnections = new Map(); // Track active peer connections
+    this.pendingRpcRequests = new Map(); // Track pending RPC requests by peer
     
     // Batching configuration - optimized for memory efficiency
     this.pendingOps = [];
@@ -72,6 +79,83 @@ class P2PDBClient {
       const timestamp = new Date().toISOString();
       console.log(`[DEBUG ${timestamp}]`, ...args);
     }
+  }
+
+  _logMemoryUsage() {
+    const memUsage = process.memoryUsage();
+    const timestamp = new Date().toISOString();
+    
+    // Convert bytes to MB for readability
+    const bytesToMB = (bytes) => {
+      if (typeof bytes !== 'number' || isNaN(bytes)) return 0;
+      return Math.round(bytes / 1024 / 1024 * 100) / 100;
+    };
+    
+    // Calculate component-specific memory usage
+    const componentMemory = {
+      // Core Node.js memory
+      rss: bytesToMB(memUsage.rss),
+      heapTotal: bytesToMB(memUsage.heapTotal),
+      heapUsed: bytesToMB(memUsage.heapUsed),
+      external: bytesToMB(memUsage.external),
+      arrayBuffers: bytesToMB(memUsage.arrayBuffers),
+      
+      // Component tracking
+      connections: this.activeConnections.size,
+      pendingRequests: this.pendingRpcRequests.size,
+      knownWriters: this.knownWriters.size,
+      indexingEntries: this.indexing.size,
+      pendingOps: this.pendingOps.length,
+      
+      // Swarm stats
+      swarmConnections: this.swarm.connections.size,
+      swarmPeers: this.swarm.peers.size,
+      
+      // Database stats
+      databaseEntries: this.countInitialized ? this.activeEntriesCount : 'Calculating...',
+      countLastUpdate: this.lastCountUpdate ? new Date(this.lastCountUpdate).toISOString() : null,
+      
+      // Memory optimization status
+      memoryOptimized: this.memoryOptimized,
+      isUpdating: this.isUpdating
+    };
+    
+    // Calculate heap fragmentation
+    const heapFragmentation = memUsage.heapTotal > 0 ? 
+      ((memUsage.heapTotal - memUsage.heapUsed) / memUsage.heapTotal * 100).toFixed(1) : 0;
+    
+    console.log(`[MEMORY ${timestamp}] RAM Usage Breakdown:`);
+    console.log(`  RSS: ${componentMemory.rss}MB (Total process memory)`);
+    console.log(`  Heap Total: ${componentMemory.heapTotal}MB (Allocated heap)`);
+    console.log(`  Heap Used: ${componentMemory.heapUsed}MB (Active heap)`);
+    console.log(`  Heap Fragmentation: ${heapFragmentation}%`);
+    console.log(`  External: ${componentMemory.external}MB (C++ objects)`);
+    console.log(`  Array Buffers: ${componentMemory.arrayBuffers}MB`);
+    console.log(`  Active Connections: ${componentMemory.connections}`);
+    console.log(`  Pending RPC Requests: ${componentMemory.pendingRequests}`);
+    console.log(`  Known Writers: ${componentMemory.knownWriters}`);
+    console.log(`  Indexing Entries: ${componentMemory.indexingEntries}`);
+    console.log(`  Pending Operations: ${componentMemory.pendingOps}`);
+    console.log(`  Swarm Connections: ${componentMemory.swarmConnections}`);
+    console.log(`  Swarm Peers: ${componentMemory.swarmPeers}`);
+    console.log(`  Database Entries: ${componentMemory.databaseEntries}`);
+    console.log(`  Memory Optimized: ${componentMemory.memoryOptimized}`);
+    console.log(`  View Updating: ${componentMemory.isUpdating}`);
+    
+    // Memory warnings
+    const warnings = [];
+    if (componentMemory.heapUsed > 500) warnings.push('High heap usage (>500MB)');
+    if (componentMemory.external > 200) warnings.push('High external memory (>200MB)');
+    if (componentMemory.connections > 50) warnings.push('Many active connections (>50)');
+    if (componentMemory.pendingRequests > 10) warnings.push('Many pending RPC requests (>10)');
+    if (componentMemory.knownWriters > 20) warnings.push('Many known writers (>20)');
+    if (parseFloat(heapFragmentation) > 50) warnings.push('High heap fragmentation (>50%)');
+    
+    if (warnings.length > 0) {
+      console.log(`  ⚠️  Warnings: ${warnings.join(', ')}`);
+    }
+    
+    return componentMemory;
   }
 
   async start() {
@@ -105,21 +189,85 @@ class P2PDBClient {
     console.log('RPC Server listening for writer key requests.');
 
     this.swarm.on('connection', async (socket, peerInfo) => {
-      console.log('Peer connected, replicating...');
+      const peerId = peerInfo.publicKey.toString('hex');
+      const peerShortId = peerId.slice(-6);
+      
+      console.log(`Peer ${peerShortId} connected, replicating...`);
       this.store.replicate(socket);
+      
+      // Track this connection
+      this.activeConnections.set(peerId, {
+        socket,
+        peerInfo,
+        connectedAt: Date.now(),
+        rpcAttempted: false
+      });
 
-      try {
-        console.log(`Requesting writer key from peer ${peerInfo.publicKey.toString('hex').slice(-6)}`);
-        const keyBuffer = await this.rpc.request(peerInfo.publicKey, 'get_writer_key', null, { timeout: 10000 });
-        const newKey = keyBuffer.toString('utf-8');
-
-        if (!this.knownWriters.has(newKey)) {
-          this.knownWriters.add(newKey);
-          console.log('Discovered new writer via RPC:', newKey);
-          this._updateView();
+      // Wait a bit to see if the connection is stable before making RPC request
+      setTimeout(async () => {
+        const connection = this.activeConnections.get(peerId);
+        if (!connection) return; // Connection was already cleaned up
+        
+        // Check if socket is still active
+        if (connection.socket && connection.socket.destroyed) {
+          console.log(`Peer ${peerShortId} disconnected before RPC attempt`);
+          return;
         }
-      } catch (err) {
-        console.error(`RPC request to peer ${peerInfo.publicKey.toString('hex').slice(-6)} failed:`, err.message);
+        
+        // Only make RPC request if we haven't already tried
+        if (connection.rpcAttempted) return;
+        connection.rpcAttempted = true;
+
+        // Make RPC request with proper cleanup
+        try {
+          console.log(`Requesting writer key from peer ${peerShortId}`);
+          
+          // Track the pending request
+          const requestPromise = this.rpc.request(peerInfo.publicKey, 'get_writer_key', null, { timeout: 5000 });
+          this.pendingRpcRequests.set(peerId, requestPromise);
+          
+          const keyBuffer = await requestPromise;
+          const newKey = keyBuffer.toString('utf-8');
+
+          if (!this.knownWriters.has(newKey)) {
+            this.knownWriters.add(newKey);
+            console.log('Discovered new writer via RPC:', newKey);
+            this._updateView();
+          }
+        } catch (err) {
+          if (err.message.includes('CHANNEL_CLOSED')) {
+            console.log(`RPC channel closed for peer ${peerShortId} (likely disconnected)`);
+          } else {
+            console.error(`RPC request to peer ${peerShortId} failed:`, err.message);
+          }
+        } finally {
+          // Clean up the pending request
+          this.pendingRpcRequests.delete(peerId);
+        }
+      }, 2000); // Wait 2 seconds before attempting RPC
+    });
+
+    // Handle peer disconnections
+    this.swarm.on('disconnection', (socket, peerInfo) => {
+      const peerId = peerInfo.publicKey.toString('hex');
+      const peerShortId = peerId.slice(-6);
+      
+      console.log(`Peer ${peerShortId} disconnected`);
+      
+      // Clean up connection tracking
+      const connection = this.activeConnections.get(peerId);
+      if (connection) {
+        const connectionDuration = Date.now() - connection.connectedAt;
+        console.log(`Peer ${peerShortId} was connected for ${Math.round(connectionDuration / 1000)}s`);
+        this.activeConnections.delete(peerId);
+      }
+      
+      // Cancel any pending RPC requests for this peer
+      const pendingRequest = this.pendingRpcRequests.get(peerId);
+      if (pendingRequest) {
+        // Note: We can't actually cancel the promise, but we can clean up the tracking
+        this.pendingRpcRequests.delete(peerId);
+        console.log(`Cleaned up pending RPC request for peer ${peerShortId}`);
       }
     });
 
@@ -128,12 +276,20 @@ class P2PDBClient {
 
     console.log('P2P Client (V4) started. Topic:', this.topicString);
     
-    // Calculate initial entry count
-    await this._calculateInitialCount();
+    // Start initial entry count calculation in background (non-blocking)
+    this._calculateInitialCount().catch(err => {
+      console.error('Background initial count calculation failed:', err);
+    });
     
     // Periodically update the view from all known writers
     setInterval(() => this._updateView(), 5000);
     this._updateView(); // Initial view update
+    
+    // Periodically clean up stale connections
+    setInterval(() => this.cleanupStaleConnections(), 120000); // Every 2 minutes - less aggressive
+    
+    // Periodically log detailed memory usage
+    setInterval(() => this._logMemoryUsage(), 30000); // Every 30 seconds
   }
 
   async _flushBatch() {
@@ -160,6 +316,11 @@ class P2PDBClient {
     }
     this._debug('[_updateView] Starting view update cycle.');
     this.isUpdating = true;
+    
+    // Log memory before view update
+    const memBefore = process.memoryUsage();
+    const heapBefore = Math.round(memBefore.heapUsed / 1024 / 1024);
+    this._debug(`[_updateView] Memory before update: ${heapBefore}MB heap used`);
 
     try {
       for (const writerKeyHex of this.knownWriters) {
@@ -360,6 +521,13 @@ class P2PDBClient {
       console.error('Error during view update:', err);
     } finally {
       this.isUpdating = false;
+      
+      // Log memory after view update
+      const memAfter = process.memoryUsage();
+      const heapAfter = Math.round(memAfter.heapUsed / 1024 / 1024);
+      const heapDelta = heapAfter - heapBefore;
+      this._debug(`[_updateView] Memory after update: ${heapAfter}MB heap used (${heapDelta >= 0 ? '+' : ''}${heapDelta}MB)`);
+      
       this._debug('[_updateView] Finished view update cycle.');
     }
   }
@@ -431,23 +599,59 @@ class P2PDBClient {
   }
 
   async getLatestSync() {
-    if (this.lastSync) {
-      return this.lastSync;
+    // If we have a cached timestamp and it's recent, use it
+    if (this.lastSync && this.lastSyncUpdate) {
+      const age = Date.now() - this.lastSyncUpdate;
+      if (age < 300000) { // 5 minutes
+        return this.lastSync;
+      }
     }
 
-    // If not cached, find it by scanning the view. This can be slow.
-    console.log('Last sync timestamp not cached, scanning view to find it...');
+    // If not cached or stale, find it by scanning the view in reverse (much faster)
+    console.log('Last sync timestamp not cached or stale, scanning view in reverse to find it...');
     let mostRecent = null;
-    for await (const { value } of this.view.createReadStream()) {
+    let checked = 0;
+    const MAX_CHECK = 1000; // Only check the last 1000 entries max
+    
+    try {
+      // Use reverse stream to check the most recent entries first
+      const stream = this.view.createReadStream({ 
+        reverse: true,
+        limit: MAX_CHECK,
+        highWaterMark: this.streamHighWaterMark
+      });
+      
+      for await (const { value } of stream) {
+        checked++;
         if (value && value.last_modified) {
-            if (!mostRecent || (new Date(value.last_modified) > new Date(mostRecent))) {
-                mostRecent = value.last_modified;
-            }
+          mostRecent = value.last_modified;
+          console.log(`Found recent timestamp in entry ${checked}: ${mostRecent}`);
+          break; // Found one, that's the most recent since we're going in reverse
         }
+        
+        // Safety check - if we've checked too many without finding a timestamp, stop
+        if (checked >= MAX_CHECK) {
+          console.log(`Checked ${MAX_CHECK} most recent entries, no timestamp found`);
+          break;
+        }
+      }
+      
+      this.lastSync = mostRecent;
+      this.lastSyncUpdate = Date.now();
+      console.log(`Discovered last sync timestamp: ${this.lastSync} (checked ${checked} entries)`);
+      return this.lastSync;
+    } catch (err) {
+      console.error('Error finding latest sync timestamp:', err);
+      return null;
     }
-    this.lastSync = mostRecent;
-    console.log(`Discovered last sync timestamp: ${this.lastSync}`);
-    return this.lastSync;
+  }
+
+  // Force refresh of last sync timestamp
+  async refreshLatestSync() {
+    console.log('Forcing refresh of last sync timestamp...');
+    this.lastSync = null;
+    this.lastSyncUpdate = null;
+    return await this.getLatestSync();
   }
 
   async getStats() {
@@ -463,7 +667,7 @@ class P2PDBClient {
     }
 
     // Use accurate entry count instead of sum of core lengths
-    const databaseEntries = this.countInitialized ? this.activeEntriesCount : 'Calculating...';
+    const databaseEntries = await this.getEntryCount();
     const lastSync = await this.getLatestSync();
     const memoryUsage = process.memoryUsage();
 
@@ -477,6 +681,8 @@ class P2PDBClient {
       nodeId: this.writer.key.toString('hex'),
       topic: this.topicString,
       connectionsActive: this.swarm.connections.size,
+      activeConnections: this.activeConnections.size,
+      pendingRpcRequests: this.pendingRpcRequests.size,
       peersFound: this.swarm.peers.size,
       knownWriters: this.knownWriters.size,
       databaseEntries,
@@ -504,8 +710,28 @@ class P2PDBClient {
     // Flush any pending operations
     await this._flushBatch();
     
+    // Clean up all active connections and pending requests
+    console.log(`Cleaning up ${this.activeConnections.size} active connections and ${this.pendingRpcRequests.size} pending RPC requests...`);
+    
+    // Clear all pending RPC requests
+    this.pendingRpcRequests.clear();
+    
+    // Close all active connections
+    for (const [peerId, connection] of this.activeConnections) {
+      try {
+        if (connection.socket && !connection.socket.destroyed) {
+          connection.socket.destroy();
+        }
+      } catch (err) {
+        console.log(`Error closing connection to peer ${peerId.slice(-6)}:`, err.message);
+      }
+    }
+    this.activeConnections.clear();
+    
     if (this.rpcServer) await this.rpcServer.close();
     await this.swarm.destroy();
+    
+    console.log('P2P Client stopped and cleaned up');
   }
 
   // Force garbage collection if available (useful after large operations)
@@ -518,6 +744,96 @@ class P2PDBClient {
       console.log('Garbage collection not available. Start Node.js with --expose-gc flag to enable.');
       return false;
     }
+  }
+
+  // Clean up stale connections and requests
+  cleanupStaleConnections() {
+    const now = Date.now();
+    const STALE_TIMEOUT = 300000; // 5 minutes - much more lenient for P2P
+    const RPC_TIMEOUT = 60000; // 1 minute for RPC requests
+    let cleanedConnections = 0;
+    let cleanedRequests = 0;
+    
+    // Clean up stale connections (only if socket is actually closed)
+    for (const [peerId, connection] of this.activeConnections) {
+      const connectionAge = now - connection.connectedAt;
+      
+      // Only clean up if connection is very old AND socket is closed
+      if (connectionAge > STALE_TIMEOUT && connection.socket && connection.socket.destroyed) {
+        try {
+          this.activeConnections.delete(peerId);
+          cleanedConnections++;
+        } catch (err) {
+          console.log(`Error cleaning up stale connection to peer ${peerId.slice(-6)}:`, err.message);
+        }
+      }
+    }
+    
+    // Clean up very old pending RPC requests
+    for (const [peerId, requestPromise] of this.pendingRpcRequests) {
+      // We can't easily track RPC request age, so just clean up if we have too many
+      if (this.pendingRpcRequests.size > 50) {
+        this.pendingRpcRequests.delete(peerId);
+        cleanedRequests++;
+      }
+    }
+    
+    if (cleanedConnections > 0 || cleanedRequests > 0) {
+      console.log(`Cleaned up ${cleanedConnections} stale connections and ${cleanedRequests} pending requests`);
+    }
+    
+    return { cleanedConnections, cleanedRequests };
+  }
+
+  // Manually trigger memory logging
+  logMemoryUsage() {
+    return this._logMemoryUsage();
+  }
+
+  // Get detailed memory analysis
+  getDetailedMemoryAnalysis() {
+    const memUsage = process.memoryUsage();
+    const componentMemory = this._logMemoryUsage();
+    
+    // Additional analysis
+    const analysis = {
+      timestamp: new Date().toISOString(),
+      memoryUsage: componentMemory,
+      recommendations: [],
+      potentialIssues: []
+    };
+    
+    // Memory pressure analysis
+    if (componentMemory.heapUsed > 1000) {
+      analysis.potentialIssues.push('Very high heap usage - consider garbage collection');
+      analysis.recommendations.push('Call forceGC() to free memory');
+    }
+    
+    if (componentMemory.external > 500) {
+      analysis.potentialIssues.push('High external memory - possible memory leak in native code');
+      analysis.recommendations.push('Check for unclosed streams or buffers');
+    }
+    
+    if (componentMemory.connections > 100) {
+      analysis.potentialIssues.push('Too many active connections');
+      analysis.recommendations.push('Review connection cleanup logic');
+    }
+    
+    if (componentMemory.pendingRequests > 20) {
+      analysis.potentialIssues.push('Many pending RPC requests - possible network issues');
+      analysis.recommendations.push('Check network connectivity and peer health');
+    }
+    
+    // Performance recommendations
+    if (!componentMemory.memoryOptimized && componentMemory.heapUsed > 200) {
+      analysis.recommendations.push('Enable memory optimization for better performance');
+    }
+    
+    if (componentMemory.knownWriters > 50) {
+      analysis.recommendations.push('Consider reducing known writers or implementing writer cleanup');
+    }
+    
+    return analysis;
   }
 
   // Get memory optimization recommendations based on current usage
@@ -554,26 +870,97 @@ class P2PDBClient {
   }
 
   async _calculateInitialCount() {
+    // Prevent multiple simultaneous calculations
+    if (this.countCalculationPromise) {
+      return this.countCalculationPromise;
+    }
+    
+    this.countCalculationPromise = this._performCountCalculation();
+    return this.countCalculationPromise;
+  }
+
+  async _performCountCalculation() {
     console.log('Calculating initial database entry count...');
+    const startTime = Date.now();
     let count = 0;
+    let processed = 0;
+    const LOG_INTERVAL = 10000; // Log progress every 10k entries
     
     try {
-      for await (const { key, value } of this.view.createReadStream()) {
+      // Use a more efficient streaming approach with progress tracking
+      const stream = this.view.createReadStream({
+        highWaterMark: this.streamHighWaterMark
+      });
+      
+      for await (const { key, value } of stream) {
         if (value) { // Only count non-null entries
           count++;
+        }
+        processed++;
+        
+        // Log progress for large databases
+        if (processed % LOG_INTERVAL === 0) {
+          const elapsed = Date.now() - startTime;
+          const rate = (processed / (elapsed / 1000)).toFixed(2);
+          console.log(`Count progress: ${processed} entries processed, ${count} valid entries found (${rate} entries/sec)`);
         }
       }
       
       this.activeEntriesCount = count;
       this.countInitialized = true;
-      console.log(`Initial database entry count: ${count}`);
+      this.lastCountUpdate = Date.now();
+      
+      const totalTime = Date.now() - startTime;
+      const finalRate = (processed / (totalTime / 1000)).toFixed(2);
+      console.log(`Initial database entry count: ${count} (${processed} total entries processed in ${totalTime}ms, ${finalRate} entries/sec)`);
+      
       return count;
     } catch (err) {
       console.error('Error calculating initial count:', err);
       this.activeEntriesCount = 0;
       this.countInitialized = true;
+      this.lastCountUpdate = Date.now();
       return 0;
+    } finally {
+      this.countCalculationPromise = null;
     }
+  }
+
+  // Get current entry count (with fallback strategies)
+  async getEntryCount() {
+    // If we have a cached count and it's recent, use it
+    if (this.countInitialized && this.lastCountUpdate) {
+      const age = Date.now() - this.lastCountUpdate;
+      if (age < 300000) { // 5 minutes
+        return this.activeEntriesCount;
+      }
+    }
+    
+    // If count is not initialized, start calculation in background
+    if (!this.countInitialized) {
+      this._calculateInitialCount().catch(err => {
+        console.error('Background count calculation failed:', err);
+      });
+      return 'Calculating...';
+    }
+    
+    // For older counts, return cached value but trigger background refresh
+    if (this.lastCountUpdate && (Date.now() - this.lastCountUpdate) > 300000) {
+      // Trigger background refresh
+      this._calculateInitialCount().catch(err => {
+        console.error('Background count refresh failed:', err);
+      });
+    }
+    
+    return this.activeEntriesCount;
+  }
+
+  // Force a fresh count calculation
+  async refreshEntryCount() {
+    console.log('Forcing fresh entry count calculation...');
+    this.countInitialized = false;
+    this.countCalculationPromise = null;
+    return await this._calculateInitialCount();
   }
 }
 
