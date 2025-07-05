@@ -276,10 +276,8 @@ class P2PDBClient {
 
     console.log('P2P Client (V4) started. Topic:', this.topicString);
     
-    // Start initial entry count calculation in background (non-blocking)
-    this._calculateInitialCount().catch(err => {
-      console.error('Background initial count calculation failed:', err);
-    });
+    // Calculate initial entry count (blocking - we want this done before proceeding)
+    await this._calculateInitialCount();
     
     // Periodically update the view from all known writers
     setInterval(() => this._updateView(), 5000);
@@ -383,6 +381,8 @@ class P2PDBClient {
         
         // Track entry count changes during this update
         let entryCountDelta = 0;
+        let newEntries = 0;
+        let deletedEntries = 0;
 
         for await (const block of stream) {
           blocksProcessed++;
@@ -405,6 +405,7 @@ class P2PDBClient {
                     const existingEntry = await this.view.get(op.key);
                     if (!existingEntry || !existingEntry.value) {
                       entryCountDelta++; // New entry
+                      newEntries++;
                     }
                     // If entry exists, it's an update - no count change
                   }
@@ -417,6 +418,7 @@ class P2PDBClient {
                     const existingEntry = await this.view.get(op.key);
                     if (existingEntry && existingEntry.value) {
                       entryCountDelta--; // Deleted existing entry
+                      deletedEntries++;
                     }
                   }
                   
@@ -437,6 +439,7 @@ class P2PDBClient {
                 const existingEntry = await this.view.get(data.key);
                 if (!existingEntry || !existingEntry.value) {
                   entryCountDelta++; // New entry
+                  newEntries++;
                 }
               }
               
@@ -448,6 +451,7 @@ class P2PDBClient {
                   const existingEntry = await this.view.get(data.key);
                   if (existingEntry && existingEntry.value) {
                     entryCountDelta--; // Deleted existing entry
+                    deletedEntries++;
                   }
                 }
                 
@@ -499,7 +503,8 @@ class P2PDBClient {
         // Apply entry count changes
         if (this.countInitialized && entryCountDelta !== 0) {
           this.activeEntriesCount += entryCountDelta;
-          this._debug(`[_updateView] Entry count delta: ${entryCountDelta >= 0 ? '+' : ''}${entryCountDelta}, new total: ${this.activeEntriesCount}`);
+          this.lastCountUpdate = Date.now();
+          this._debug(`[_updateView] Entry count delta: ${entryCountDelta >= 0 ? '+' : ''}${entryCountDelta} (${newEntries} new, ${deletedEntries} deleted), new total: ${this.activeEntriesCount}`);
         }
         
         const processTime = Date.now() - processStartTime;
@@ -667,7 +672,7 @@ class P2PDBClient {
     }
 
     // Use accurate entry count instead of sum of core lengths
-    const databaseEntries = await this.getEntryCount();
+    const databaseEntries = this.getEntryCount();
     const lastSync = await this.getLatestSync();
     const memoryUsage = process.memoryUsage();
 
@@ -870,39 +875,14 @@ class P2PDBClient {
   }
 
   async _calculateInitialCount() {
-    // Prevent multiple simultaneous calculations
-    if (this.countCalculationPromise) {
-      return this.countCalculationPromise;
-    }
-    
-    this.countCalculationPromise = this._performCountCalculation();
-    return this.countCalculationPromise;
-  }
-
-  async _performCountCalculation() {
     console.log('Calculating initial database entry count...');
     const startTime = Date.now();
     let count = 0;
-    let processed = 0;
-    const LOG_INTERVAL = 10000; // Log progress every 10k entries
     
     try {
-      // Use a more efficient streaming approach with progress tracking
-      const stream = this.view.createReadStream({
-        highWaterMark: this.streamHighWaterMark
-      });
-      
-      for await (const { key, value } of stream) {
+      for await (const { key, value } of this.view.createReadStream()) {
         if (value) { // Only count non-null entries
           count++;
-        }
-        processed++;
-        
-        // Log progress for large databases
-        if (processed % LOG_INTERVAL === 0) {
-          const elapsed = Date.now() - startTime;
-          const rate = (processed / (elapsed / 1000)).toFixed(2);
-          console.log(`Count progress: ${processed} entries processed, ${count} valid entries found (${rate} entries/sec)`);
         }
       }
       
@@ -911,8 +891,7 @@ class P2PDBClient {
       this.lastCountUpdate = Date.now();
       
       const totalTime = Date.now() - startTime;
-      const finalRate = (processed / (totalTime / 1000)).toFixed(2);
-      console.log(`Initial database entry count: ${count} (${processed} total entries processed in ${totalTime}ms, ${finalRate} entries/sec)`);
+      console.log(`Initial database entry count: ${count} (calculated in ${totalTime}ms)`);
       
       return count;
     } catch (err) {
@@ -921,37 +900,14 @@ class P2PDBClient {
       this.countInitialized = true;
       this.lastCountUpdate = Date.now();
       return 0;
-    } finally {
-      this.countCalculationPromise = null;
     }
   }
 
-  // Get current entry count (with fallback strategies)
-  async getEntryCount() {
-    // If we have a cached count and it's recent, use it
-    if (this.countInitialized && this.lastCountUpdate) {
-      const age = Date.now() - this.lastCountUpdate;
-      if (age < 300000) { // 5 minutes
-        return this.activeEntriesCount;
-      }
-    }
-    
-    // If count is not initialized, start calculation in background
+  // Get current entry count
+  getEntryCount() {
     if (!this.countInitialized) {
-      this._calculateInitialCount().catch(err => {
-        console.error('Background count calculation failed:', err);
-      });
       return 'Calculating...';
     }
-    
-    // For older counts, return cached value but trigger background refresh
-    if (this.lastCountUpdate && (Date.now() - this.lastCountUpdate) > 300000) {
-      // Trigger background refresh
-      this._calculateInitialCount().catch(err => {
-        console.error('Background count refresh failed:', err);
-      });
-    }
-    
     return this.activeEntriesCount;
   }
 
@@ -959,7 +915,6 @@ class P2PDBClient {
   async refreshEntryCount() {
     console.log('Forcing fresh entry count calculation...');
     this.countInitialized = false;
-    this.countCalculationPromise = null;
     return await this._calculateInitialCount();
   }
 }
