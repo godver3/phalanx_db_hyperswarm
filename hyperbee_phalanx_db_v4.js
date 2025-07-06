@@ -52,6 +52,10 @@ class P2PDBClient {
     this.activeEntriesCount = 0; // Track accurate entry count
     this.countInitialized = false; // Flag to track if initial count is done
     
+    // Memory management
+    this.activeCores = new Map(); // Track active core references
+    this.coreCleanupInterval = null;
+    
     // Batching configuration - optimized for memory efficiency
     this.pendingOps = [];
     this.batchSize = options.batchSize || 100; // Group 100 operations per block
@@ -133,6 +137,10 @@ class P2PDBClient {
     
     // Periodically update the view from all known writers
     setInterval(() => this._updateView(), 5000);
+    
+    // Setup core cleanup to prevent memory leaks
+    this.coreCleanupInterval = setInterval(() => this._cleanupUnusedCores(), 60000); // Every minute
+    
     this._updateView(); // Initial view update
   }
 
@@ -170,6 +178,12 @@ class P2PDBClient {
           : 0;
         const core = this.store.get(Buffer.from(writerKeyHex, 'hex'));
         await core.ready();
+        
+        // Track this core for cleanup
+        this.activeCores.set(writerKeyHex, {
+          core,
+          lastUsed: Date.now()
+        });
 
         const startIndex = this.indexing.get(writerKeyHex) || 0;
         
@@ -223,7 +237,8 @@ class P2PDBClient {
         // Track entry count changes during this update
         let entryCountDelta = 0;
 
-        for await (const block of stream) {
+        try {
+          for await (const block of stream) {
           blocksProcessed++;
           try {
             const data = JSON.parse(block);
@@ -334,6 +349,19 @@ class P2PDBClient {
         const finalIndex = core.length;
         this.indexing.set(writerKeyHex, finalIndex);
         await this.indexingBee.put(writerKeyHex, finalIndex);
+        } finally {
+          // Clean up resources to prevent memory leaks
+          if (stream && typeof stream.destroy === 'function') {
+            stream.destroy();
+          }
+          if (batch && typeof batch.flush === 'function') {
+            try {
+              await batch.flush();
+            } catch (err) {
+              this._debug(`[_updateView] Error flushing final batch: ${err.message}`);
+            }
+          }
+        }
         
         // Apply entry count changes
         if (this.countInitialized && entryCountDelta !== 0) {
@@ -504,6 +532,15 @@ class P2PDBClient {
     // Flush any pending operations
     await this._flushBatch();
     
+    // Clean up intervals
+    if (this.coreCleanupInterval) {
+      clearInterval(this.coreCleanupInterval);
+      this.coreCleanupInterval = null;
+    }
+    
+    // Clean up active cores
+    this.activeCores.clear();
+    
     if (this.rpcServer) await this.rpcServer.close();
     await this.swarm.destroy();
   }
@@ -573,6 +610,23 @@ class P2PDBClient {
       this.activeEntriesCount = 0;
       this.countInitialized = true;
       return 0;
+    }
+  }
+
+  async _cleanupUnusedCores() {
+    const now = Date.now();
+    const CORE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+    
+    for (const [writerKey, coreInfo] of this.activeCores.entries()) {
+      if (now - coreInfo.lastUsed > CORE_TIMEOUT) {
+        this._debug(`[_cleanupUnusedCores] Removing unused core for writer ${writerKey.slice(-6)}`);
+        this.activeCores.delete(writerKey);
+        
+        // Force garbage collection if available
+        if (global.gc) {
+          global.gc();
+        }
+      }
     }
   }
 }
