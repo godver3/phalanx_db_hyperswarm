@@ -171,11 +171,13 @@ class P2PDBClient {
 
     try {
       for (const writerKeyHex of this.knownWriters) {
+        let finalIndex = null; // <-- ensure always defined
         const writerStartTime = Date.now();
         const memUsage = process.memoryUsage();
         const initialMemory = (typeof memUsage.heapUsed === 'number' && !isNaN(memUsage.heapUsed)) 
           ? memUsage.heapUsed / 1024 / 1024 
           : 0;
+        this._debug(`[_updateView] Starting update for writer ${writerKeyHex.slice(-6)}. Initial heap: ${initialMemory}MB`);
         const core = this.store.get(Buffer.from(writerKeyHex, 'hex'));
         await core.ready();
         
@@ -188,6 +190,7 @@ class P2PDBClient {
         const startIndex = this.indexing.get(writerKeyHex) || 0;
         
         if (core.length <= startIndex) {
+          this._debug(`[_updateView] No new ops for writer ${writerKeyHex.slice(-6)} (core.length=${core.length}, startIndex=${startIndex})`);
           continue;
         }
 
@@ -240,6 +243,9 @@ class P2PDBClient {
         try {
           for await (const block of stream) {
           blocksProcessed++;
+          if (blocksProcessed % 1000 === 0) {
+            this._debug(`[_updateView] Processed ${blocksProcessed} blocks for writer ${writerKeyHex.slice(-6)}`);
+          }
           try {
             const data = JSON.parse(block);
             
@@ -346,7 +352,7 @@ class P2PDBClient {
           this._debug(`[_updateView] Final batch flush took ${Date.now() - flushStartTime}ms.`);
         }
         
-        const finalIndex = core.length;
+        finalIndex = core.length;
         this.indexing.set(writerKeyHex, finalIndex);
         await this.indexingBee.put(writerKeyHex, finalIndex);
         } finally {
@@ -377,12 +383,7 @@ class P2PDBClient {
           : 0;
         const memoryDelta = initialMemory > 0 && finalMemory > 0 ? Math.round(finalMemory - initialMemory) : 0;
         
-        if (finalMemory > 0) {
-          console.log(`Indexed writer ${writerKeyHex.slice(-6)} up to ${finalIndex}. Memory: ${Math.round(finalMemory)}MB (${memoryDelta >= 0 ? '+' : ''}${memoryDelta}MB)`);
-        } else {
-          console.log(`Indexed writer ${writerKeyHex.slice(-6)} up to ${finalIndex}`);
-        }
-        this._debug(`[_updateView] Writer ${writerKeyHex.slice(-6)} timing: download=${downloadTime}ms, process=${processTime}ms, total=${totalTime}ms`);
+        this._debug(`[_updateView] Writer ${writerKeyHex.slice(-6)} finished. Indexed up to ${finalIndex}. Memory: ${Math.round(finalMemory)}MB (${memoryDelta >= 0 ? '+' : ''}${memoryDelta}MB), processed ${blocksProcessed} blocks in ${totalTime}ms.`);
       }
     } catch (err) {
       console.error('Error during view update:', err);
