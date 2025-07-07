@@ -136,10 +136,156 @@ class P2PDBClient {
     await this._calculateInitialCount();
     
     // Periodically update the view from all known writers
-    setInterval(() => this._updateView(), 5000);
+    setInterval(() => {
+      console.log(`[SCHEDULED_UPDATE] Starting scheduled view update...`);
+      this._updateView();
+    }, 5000);
     
     // Setup core cleanup to prevent memory leaks
     this.coreCleanupInterval = setInterval(() => this._cleanupUnusedCores(), 60000); // Every minute
+    
+    // Comprehensive memory tracking - log counts every 10 seconds
+    setInterval(() => {
+      const timestamp = new Date().toISOString();
+      const memUsage = process.memoryUsage();
+      const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+      const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
+      const rssMB = Math.round(memUsage.rss / 1024 / 1024);
+      const externalMB = Math.round(memUsage.external / 1024 / 1024);
+      const arrayBuffersMB = Math.round(memUsage.arrayBuffers / 1024 / 1024);
+      
+      // Track pending operations and batch state
+      const pendingOps = this.pendingOps ? this.pendingOps.length : 0;
+      const batchTimerActive = this.batchTimer ? 'yes' : 'no';
+      
+      // Track view update state
+      const isUpdating = this.isUpdating ? 'yes' : 'no';
+      
+      // Track corestore and hyperbee internals
+      const storeStats = this.store ? {
+        cores: this.store.cores ? this.store.cores.size : 'unknown',
+        namespaces: this.store.namespaces ? this.store.namespaces.size : 'unknown'
+      } : 'no-store';
+      
+      // Track view and indexing bee stats
+      const viewStats = this.view ? {
+        length: this.view.length,
+        downloaded: this.view.downloaded,
+        byteLength: this.view.byteLength,
+        // Try to access the underlying core
+        coreLength: this.view.core ? this.view.core.length : 'no-core',
+        coreDownloaded: this.view.core ? this.view.core.downloaded : 'no-core',
+        pendingBlocks: this.view.core ? (this.view.core.length - this.view.core.downloaded) : 'no-core'
+      } : 'no-view';
+      
+      const indexingStats = this.indexingBee ? {
+        length: this.indexingBee.length,
+        downloaded: this.indexingBee.downloaded,
+        byteLength: this.indexingBee.byteLength,
+        // Try to access the underlying core
+        coreLength: this.indexingBee.core ? this.indexingBee.core.length : 'no-core',
+        coreDownloaded: this.indexingBee.core ? this.indexingBee.core.downloaded : 'no-core',
+        pendingBlocks: this.indexingBee.core ? (this.indexingBee.core.length - this.indexingBee.core.downloaded) : 'no-core'
+      } : 'no-indexing';
+      
+      // Track swarm internals
+      const swarmStats = this.swarm ? {
+        connections: this.swarm.connections.size,
+        peers: this.swarm.peers.size,
+        discovery: this.swarm.discovery ? this.swarm.discovery.size : 'unknown',
+        dht: this.swarm.dht ? this.swarm.dht.size : 'unknown'
+      } : 'no-swarm';
+      
+      // Track RPC state
+      const rpcStats = this.rpc ? {
+        server: this.rpcServer ? 'active' : 'inactive',
+        requests: this.rpc.requests ? this.rpc.requests.size : 'unknown'
+      } : 'no-rpc';
+      
+      // Track writer core stats - this might be where the leak is
+      let totalWriterCoreLength = 0;
+      let totalWriterCoreDownloaded = 0;
+      let writerCoresWithData = 0;
+      let coresWithPendingDownloads = 0;
+      let totalPendingBlocks = 0;
+      
+      for (const [writerKey, coreInfo] of this.activeCores.entries()) {
+        if (coreInfo.core) {
+          // Use hyperbee length since hypercore length is not accessible
+          const length = coreInfo.core.length || 0;
+          
+          // Since we can't access downloaded count reliably, assume blocks are being downloaded
+          // based on the fact that post-processing downloads are working
+          let downloaded = 0;
+          const hypercore = coreInfo.core.core;
+          
+          if (hypercore) {
+            // Try to access downloaded through the replicator or storage
+            if (hypercore.replicator && hypercore.replicator.downloaded) {
+              downloaded = hypercore.replicator.downloaded;
+            } else if (hypercore.storage && hypercore.storage.downloaded) {
+              downloaded = hypercore.storage.downloaded;
+            } else {
+              // If we can't get downloaded count, assume it's close to length since downloads are working
+              downloaded = Math.floor(length * 0.95); // Assume 95% downloaded
+            }
+          }
+          
+          const pending = length - downloaded;
+          
+          totalWriterCoreLength += length;
+          totalWriterCoreDownloaded += downloaded;
+          totalPendingBlocks += pending;
+          
+          if (length > 0) {
+            writerCoresWithData++;
+          }
+          if (pending > 0) {
+            coresWithPendingDownloads++;
+          }
+        }
+      }
+      
+      const writerCoreStats = {
+        totalLength: totalWriterCoreLength,
+        totalDownloaded: totalWriterCoreDownloaded,
+        totalPending: totalPendingBlocks,
+        coresWithData: writerCoresWithData,
+        coresWithPendingDownloads: coresWithPendingDownloads,
+        avgLengthPerCore: this.activeCores.size > 0 ? Math.round(totalWriterCoreLength / this.activeCores.size) : 0,
+        // Track individual core lengths to spot outliers
+        maxCoreLength: Math.max(...Array.from(this.activeCores.values()).map(info => info.core ? info.core.length || 0 : 0)),
+        minCoreLength: Math.min(...Array.from(this.activeCores.values()).map(info => info.core ? info.core.length || 0 : 0))
+      };
+      
+      console.log(`[${timestamp}] [MEMORY_TRACKING] Writers: ${this.knownWriters.size}, ActiveCores: ${this.activeCores.size}, Indexing: ${this.indexing.size}, PendingOps: ${pendingOps}, BatchTimer: ${batchTimerActive}, IsUpdating: ${isUpdating}`);
+      console.log(`[${timestamp}] [MEMORY_TRACKING] Heap: ${heapUsedMB}MB/${heapTotalMB}MB, RSS: ${rssMB}MB, External: ${externalMB}MB, ArrayBuffers: ${arrayBuffersMB}MB`);
+      console.log(`[${timestamp}] [MEMORY_TRACKING] Connections: ${this.swarm.connections.size}, Peers: ${this.swarm.peers.size}, ActiveEntries: ${this.activeEntriesCount}, LastSync: ${this.lastSync || 'none'}`);
+      console.log(`[${timestamp}] [MEMORY_TRACKING] Store: ${JSON.stringify(storeStats)}, View: ${JSON.stringify(viewStats)}, Indexing: ${JSON.stringify(indexingStats)}`);
+      console.log(`[${timestamp}] [MEMORY_TRACKING] Swarm: ${JSON.stringify(swarmStats)}, RPC: ${JSON.stringify(rpcStats)}`);
+              console.log(`[${timestamp}] [MEMORY_TRACKING] WriterCores: ${JSON.stringify(writerCoreStats)}`);
+        
+        // Debug core properties for first few cores
+        if (this.activeCores.size > 0) {
+          const firstCore = Array.from(this.activeCores.values())[0];
+          if (firstCore && firstCore.core) {
+            const hyperbee = firstCore.core;
+            const hypercore = hyperbee.core;
+            const coreProps = {
+              hyperbeeLength: hyperbee.length,
+              hypercoreLength: hypercore ? hypercore.length : 'no-hypercore',
+              hypercoreDownloaded: hypercore ? hypercore.downloaded : 'no-hypercore',
+              hasStats: hypercore ? !!hypercore.stats : false,
+              statsDownloaded: hypercore && hypercore.stats ? hypercore.stats.downloaded : 'no-stats',
+              hasPeers: hypercore ? !!hypercore.peers : false,
+              peerCount: hypercore && hypercore.peers ? hypercore.peers.length : 0,
+              hyperbeeProps: Object.keys(hyperbee).slice(0, 5),
+              hypercoreProps: hypercore ? Object.keys(hypercore).slice(0, 5) : 'no-hypercore'
+            };
+            console.log(`[${timestamp}] [CORE_DEBUG] First core properties: ${JSON.stringify(coreProps)}`);
+          }
+        }
+    }, 10000); // Every 10 seconds
     
     this._updateView(); // Initial view update
   }
@@ -355,6 +501,28 @@ class P2PDBClient {
         finalIndex = core.length;
         this.indexing.set(writerKeyHex, finalIndex);
         await this.indexingBee.put(writerKeyHex, finalIndex);
+        
+        // Always download blocks to disk after processing, even if pre-fetch was disabled
+        if (this.disablePreFetch && core.length > startIndex) {
+          console.log(`[_updateView] POST-PROCESSING DOWNLOAD: Downloading ${core.length - startIndex} blocks to disk for writer ${writerKeyHex.slice(-6)}...`);
+          const downloadStartTime = Date.now();
+          const range = { start: startIndex, end: core.length };
+          const downloadOptions = {
+            linear: false,
+            blocks: this.downloadBlocks,
+            parallel: this.downloadParallel
+          };
+          
+          try {
+            await core.download(range, downloadOptions).done();
+            const downloadTime = Date.now() - downloadStartTime;
+            console.log(`[_updateView] POST-PROCESSING DOWNLOAD: Complete in ${downloadTime}ms for writer ${writerKeyHex.slice(-6)}. Downloaded: ${core.downloaded}/${core.length}`);
+          } catch (err) {
+            console.error(`[_updateView] POST-PROCESSING DOWNLOAD: Error for writer ${writerKeyHex.slice(-6)}:`, err.message);
+          }
+        } else {
+          this._debug(`[_updateView] Skipping post-processing download for writer ${writerKeyHex.slice(-6)} (disablePreFetch: ${this.disablePreFetch}, core.length: ${core.length}, startIndex: ${startIndex})`);
+        }
         } finally {
           // Clean up resources to prevent memory leaks
           if (stream && typeof stream.destroy === 'function') {

@@ -1,0 +1,17 @@
+[Unit]
+Description=Phalanx DB REST API v4
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/hyperswarm
+ExecStart=/usr/bin/node phalanx_db_rest_v4.js
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=phalanx-db-rest
+
+[Install]
+WantedBy=multi-user.target 
