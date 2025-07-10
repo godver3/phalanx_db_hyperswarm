@@ -9,6 +9,8 @@ import Hyperbee from 'hyperbee';
 import RPC from '@hyperswarm/rpc';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import fs from 'fs';
+import { rm } from 'fs/promises';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -26,6 +28,7 @@ class P2PDBClient {
    * @param {number} options.downloadBlocks - Blocks per download chunk (default: 128 if optimized, 1024 if not)
    * @param {number} options.streamHighWaterMark - Stream buffer size (default: 16 if optimized, 64 if not)
    * @param {boolean} options.disablePreFetch - Disable pre-fetching of blocks (default: true if optimized)
+   * @param {boolean} options.autoClearStorage - Automatically clear storage on device file errors (default: true)
    */
   constructor(options = {}) {
     this.storageDir = options.storageDir || path.join(__dirname, 'autobase_storage_v4');
@@ -69,6 +72,9 @@ class P2PDBClient {
     this.downloadBlocks = options.downloadBlocks || (this.memoryOptimized ? 128 : 1024);
     this.streamHighWaterMark = options.streamHighWaterMark || (this.memoryOptimized ? 16 : 64);
     this.disablePreFetch = options.disablePreFetch || this.memoryOptimized;
+    
+    // Storage management settings
+    this.autoClearStorage = options.autoClearStorage !== false; // Default to true
   }
 
   _debug(...args) {
@@ -78,20 +84,97 @@ class P2PDBClient {
     }
   }
 
-  async start() {
-    this.writer = this.store.get({ name: 'local-writer' });
-    this.view = new Hyperbee(this.store.get({ name: 'view' }), {
-      keyEncoding: 'utf-8',
-      valueEncoding: 'json'
-    });
-    this.indexingBee = new Hyperbee(this.store.get({ name: 'indexing-state' }), {
-      keyEncoding: 'utf-8',
-      valueEncoding: 'json'
-    });
+  async _clearStorageDirectory() {
+    try {
+      console.log(`Clearing storage directory: ${this.storageDir}`);
+      
+      // Check if directory exists
+      if (fs.existsSync(this.storageDir)) {
+        // Remove the entire directory and its contents
+        await rm(this.storageDir, { recursive: true, force: true });
+        console.log(`Successfully cleared storage directory: ${this.storageDir}`);
+      } else {
+        console.log(`Storage directory does not exist: ${this.storageDir}`);
+      }
+    } catch (err) {
+      console.error(`Error clearing storage directory: ${err.message}`);
+      throw err;
+    }
+  }
 
-    await this.writer.ready();
-    await this.view.ready();
-    await this.indexingBee.ready();
+  /**
+   * Manually clear the storage directory
+   * @returns {Promise<void>}
+   */
+  async clearStorage() {
+    await this._clearStorageDirectory();
+  }
+
+  async _isDeviceFileError(error) {
+    // Check if this is a device file validation error
+    return error.message && (
+      error.message.includes('Invalid device file') ||
+      error.message.includes('was modified') ||
+      error.message.includes('device-file') ||
+      error.message.includes('verifyDeviceFile')
+    );
+  }
+
+  async start() {
+    try {
+      this.writer = this.store.get({ name: 'local-writer' });
+      this.view = new Hyperbee(this.store.get({ name: 'view' }), {
+        keyEncoding: 'utf-8',
+        valueEncoding: 'json'
+      });
+      this.indexingBee = new Hyperbee(this.store.get({ name: 'indexing-state' }), {
+        keyEncoding: 'utf-8',
+        valueEncoding: 'json'
+      });
+
+      await this.writer.ready();
+      await this.view.ready();
+      await this.indexingBee.ready();
+    } catch (error) {
+      // Check if this is a device file validation error
+      if (await this._isDeviceFileError(error)) {
+        if (this.autoClearStorage) {
+          console.log('Detected device file validation error. Clearing storage directory and retrying...');
+          
+          // Clear the storage directory
+          await this._clearStorageDirectory();
+          
+          // Recreate the store and retry
+          this.store = new Corestore(this.storageDir);
+          
+          this.writer = this.store.get({ name: 'local-writer' });
+          this.view = new Hyperbee(this.store.get({ name: 'view' }), {
+            keyEncoding: 'utf-8',
+            valueEncoding: 'json'
+          });
+          this.indexingBee = new Hyperbee(this.store.get({ name: 'indexing-state' }), {
+            keyEncoding: 'utf-8',
+            valueEncoding: 'json'
+          });
+
+          await this.writer.ready();
+          await this.view.ready();
+          await this.indexingBee.ready();
+          
+          console.log('Successfully recovered from device file error by clearing storage.');
+        } else {
+          console.error('Device file validation error detected, but autoClearStorage is disabled.');
+          console.error('To resolve this issue, either:');
+          console.error('1. Enable autoClearStorage: new P2PDBClient({ autoClearStorage: true })');
+          console.error('2. Manually clear the storage directory:', this.storageDir);
+          console.error('3. Use a different storage directory');
+          throw error;
+        }
+      } else {
+        // Re-throw if it's not a device file error
+        throw error;
+      }
+    }
 
     // Load persisted indexing state
     for await (const { key, value } of this.indexingBee.createReadStream()) {
@@ -327,13 +410,16 @@ class P2PDBClient {
         const core = this.store.get(Buffer.from(writerKeyHex, 'hex'));
         await core.ready();
         
-        // Track this core for cleanup
-        this.activeCores.set(writerKeyHex, {
-          core,
-          lastUsed: Date.now()
-        });
-
         const startIndex = this.indexing.get(writerKeyHex) || 0;
+        
+        // Only track cores that have new data to process
+        if (core.length > startIndex) {
+          // Track this core for cleanup
+          this.activeCores.set(writerKeyHex, {
+            core,
+            lastUsed: Date.now()
+          });
+        }
         
         if (core.length <= startIndex) {
           this._debug(`[_updateView] No new ops for writer ${writerKeyHex.slice(-6)} (core.length=${core.length}, startIndex=${startIndex})`);
@@ -650,8 +736,17 @@ class P2PDBClient {
   async getStats() {
     const writerStats = {};
     for (const writerKey of this.knownWriters) {
-      const core = this.store.get(Buffer.from(writerKey, 'hex'));
-      await core.ready();
+      // Check if we already have this core in activeCores
+      let core;
+      const coreInfo = this.activeCores.get(writerKey);
+      if (coreInfo && coreInfo.core) {
+        core = coreInfo.core;
+      } else {
+        // If not, get it from store (it will be cleaned up later if not used)
+        core = this.store.get(Buffer.from(writerKey, 'hex'));
+        await core.ready();
+      }
+      
       writerStats[writerKey.slice(-6)] = {
         key: writerKey,
         indexedLength: this.indexing.get(writerKey) || 0,
@@ -692,7 +787,8 @@ class P2PDBClient {
         downloadParallel: this.downloadParallel,
         downloadBlocks: this.downloadBlocks,
         streamHighWaterMark: this.streamHighWaterMark,
-        disablePreFetch: this.disablePreFetch
+        disablePreFetch: this.disablePreFetch,
+        autoClearStorage: this.autoClearStorage
       }
     };
   }
@@ -707,7 +803,16 @@ class P2PDBClient {
       this.coreCleanupInterval = null;
     }
     
-    // Clean up active cores
+    // Clean up active cores - close them properly first
+    for (const [writerKey, coreInfo] of this.activeCores.entries()) {
+      if (coreInfo.core && typeof coreInfo.core.close === 'function') {
+        try {
+          await coreInfo.core.close();
+        } catch (err) {
+          this._debug(`[stop] Error closing core for writer ${writerKey.slice(-6)}: ${err.message}`);
+        }
+      }
+    }
     this.activeCores.clear();
     
     if (this.rpcServer) await this.rpcServer.close();
@@ -784,11 +889,21 @@ class P2PDBClient {
 
   async _cleanupUnusedCores() {
     const now = Date.now();
-    const CORE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+    const CORE_TIMEOUT = 30 * 1000; // 30 seconds (reduced from 5 minutes)
     
     for (const [writerKey, coreInfo] of this.activeCores.entries()) {
       if (now - coreInfo.lastUsed > CORE_TIMEOUT) {
         this._debug(`[_cleanupUnusedCores] Removing unused core for writer ${writerKey.slice(-6)}`);
+        
+        // Close the Hyperbee instance to release resources
+        if (coreInfo.core && typeof coreInfo.core.close === 'function') {
+          try {
+            await coreInfo.core.close();
+          } catch (err) {
+            this._debug(`[_cleanupUnusedCores] Error closing core: ${err.message}`);
+          }
+        }
+        
         this.activeCores.delete(writerKey);
         
         // Force garbage collection if available
